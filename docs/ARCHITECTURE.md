@@ -19,7 +19,7 @@
 > TypeScript compiler API**. Frontend = **Next.js 16 (App Router) + React Flow + GSAP +
 > Tailwind v4**. LLMs/embeddings are **provider-abstracted** (Anthropic / OpenAI /
 > OpenRouter / local Ollama) with offline deterministic fallbacks. The reference local
-> setup runs **fully offline-capable**: Ollama `mxbai-embed-large` (1024-d) for embeddings
+> setup runs **fully offline-capable**: Ollama `mxbai-embed-large` (768-d) for embeddings
 > and `qwen2.5-coder` (or OpenRouter) for chat.
 
 ---
