@@ -50,7 +50,7 @@ docker compose up -d        # Postgres 16 + pgvector on :5432, schema auto-appli
 
 ### 2. Configure
 ```bash
-cp backend/.env.example backend/.env          # set provider keys (or run fully offline)
+cp backend/.env.example backend/.env          # set provider keys (or run offline)
 cp frontend/.env.example frontend/.env.local  # optional: OAuth; defaults work locally
 ```
 The app runs **100% offline** with no keys (deterministic embeddings + a template LLM responder). Add an embedding/LLM provider key in `backend/.env` to enable the semantic layer, docs, and the Tier-2 bug analysis. See `backend/.env.example` for every option.
