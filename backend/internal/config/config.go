@@ -36,7 +36,10 @@ type Config struct {
 
 	// LLM (answer synthesis).
 	LLMProvider    string // auto | template | anthropic | openai | openrouter | ollama
-	LLMModel       string
+	LLMModel       string // base model — assistant (RAG), blueprint, tours, enrichment
+	DocsModel      string // optional stronger model for documentation generation
+	ArchModel      string // optional stronger model for architecture generation
+	BugsModel      string // optional stronger model for the Tier-2 bug analysis
 	AnthropicKey   string
 	OpenAIKey      string
 	OpenAIBase     string
@@ -49,6 +52,9 @@ type Config struct {
 	// Bug detection (Tier-2 adversarial LLM pass).
 	BugsLLM    bool
 	BugsMaxLLM int
+
+	// Dead-code pruning: LLM verification of file-level candidates.
+	PruneVerify bool
 
 	// Blueprint discovery.
 	BlueprintConcurrency int
@@ -94,6 +100,9 @@ func Load() Config {
 
 		LLMProvider:    getEnv("SYNAPSE_LLM_PROVIDER", "auto"),
 		LLMModel:       getEnv("SYNAPSE_LLM_MODEL", ""),
+		DocsModel:      getEnv("SYNAPSE_DOCS_MODEL", ""),
+		ArchModel:      getEnv("SYNAPSE_ARCH_MODEL", ""),
+		BugsModel:      getEnv("SYNAPSE_BUGS_MODEL", ""),
 		AnthropicKey:   getEnv("ANTHROPIC_API_KEY", ""),
 		OpenAIKey:      getEnv("OPENAI_API_KEY", ""),
 		OpenAIBase:     getEnv("OPENAI_BASE_URL", ""),
@@ -104,6 +113,8 @@ func Load() Config {
 
 		BugsLLM:    getEnvBool("SYNAPSE_BUGS_LLM", true),
 		BugsMaxLLM: getEnvInt("SYNAPSE_BUGS_MAX_LLM", 8),
+
+		PruneVerify: getEnvBool("SYNAPSE_PRUNE_VERIFY", true),
 
 		BlueprintConcurrency: getEnvInt("SYNAPSE_BLUEPRINT_CONCURRENCY", 6),
 

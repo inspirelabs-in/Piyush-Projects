@@ -42,20 +42,27 @@ docs/       Architecture logs & system schemas
 
 **Prerequisites:** Docker, Go 1.26+, Node 20+.
 
-### 1. Start the database
+### 1. Install dependencies
+Installs the Go modules, the frontend packages, **and the TypeScript parser subprocess deps** (without which `.ts`/`.tsx` ingestion fails):
 ```bash
-cd docker
-docker compose up -d        # Postgres 16 + pgvector on :5432, schema auto-applied
+make setup                  # macOS / Linux / Windows-with-make
+# Windows without make:
+.\setup.ps1
 ```
 
-### 2. Configure
+### 2. Start the database
+```bash
+make db-up                  # or: cd docker && docker compose up -d
+```
+
+### 3. Configure
 ```bash
 cp backend/.env.example backend/.env          # set provider keys (or run offline)
 cp frontend/.env.example frontend/.env.local  # optional: OAuth; defaults work locally
 ```
 The app runs **100% offline** with no keys (deterministic embeddings + a template LLM responder). Add an embedding/LLM provider key in `backend/.env` to enable the semantic layer, docs, and the Tier-2 bug analysis. See `backend/.env.example` for every option.
 
-### 3. Run the backend
+### 4. Run the backend
 ```bash
 cd backend
 ./run.ps1                   # Windows: loads .env, then `go run ./cmd/server`
@@ -63,10 +70,9 @@ cd backend
 ```
 API listens on `http://localhost:8080`.
 
-### 4. Run the frontend
+### 5. Run the frontend
 ```bash
 cd frontend
-npm install
 npm run dev                 # next dev --webpack  →  http://localhost:3000
 ```
 
@@ -84,6 +90,16 @@ All backend config is environment-driven (`backend/internal/config`). Copy `back
 
 ## Development
 
+Common tasks are wrapped in the `Makefile` (run `make help` for the full list):
+
+| Command | Does |
+| --- | --- |
+| `make setup` | install all dependencies (Go, frontend, TS parser) |
+| `make db-up` / `make db-down` | start / stop the Postgres + pgvector container |
+| `make build` | build backend + frontend |
+| `make test` | `go test ./...` + frontend `tsc --noEmit` |
+
+Or run them directly:
 ```bash
 # Backend
 cd backend && go build ./... && go test ./...
@@ -91,3 +107,5 @@ cd backend && go build ./... && go test ./...
 # Frontend
 cd frontend && npx tsc --noEmit && npm run lint
 ```
+
+> On Windows without `make`, use `.\setup.ps1` for the setup step; the rest are one-line commands above.

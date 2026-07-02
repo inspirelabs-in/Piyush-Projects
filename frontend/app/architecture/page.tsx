@@ -250,7 +250,9 @@ function ArchNode({ data }: NodeProps) {
 const nodeTypes: NodeTypes = { archComponent: ArchNode };
 
 // Stack each column from measured heights so expanded cards never overlap.
-function relayout(nodes: Node[]): Node[] {
+// Nodes the user has dragged (`pinned`) keep their manual position and are
+// skipped, so auto-stacking never snaps a moved card back.
+function relayout(nodes: Node[], pinned: Set<string>): Node[] {
   const layers: string[] = [];
   for (const l of LAYER_ORDER) if (nodes.some((n) => (n.data as ArchNodeData).layer === l)) layers.push(l);
   for (const n of nodes) {
@@ -272,11 +274,12 @@ function relayout(nodes: Node[]): Node[] {
     arr.sort((a, b) => (a.data as ArchNodeData).order - (b.data as ArchNodeData).order);
     let y = 0;
     for (const n of arr) {
+      if (pinned.has(n.id)) continue; // leave dragged cards where the user put them
       pos.set(n.id, { x: col * COL_WIDTH, y });
       y += (n.measured?.height ?? FALLBACK_H) + ROW_GAP;
     }
   }
-  return nodes.map((n) => ({ ...n, position: pos.get(n.id) ?? n.position }));
+  return nodes.map((n) => (pinned.has(n.id) ? n : { ...n, position: pos.get(n.id) ?? n.position }));
 }
 
 export default function ArchitecturePage() {
@@ -291,6 +294,12 @@ export default function ArchitecturePage() {
   const requestReflow = useCallback(() => setReflowTick((t) => t + 1), []);
   const repoRef = useRef<string | null>(null);
   repoRef.current = repo;
+  // Nodes the user has dragged — the auto-stacker leaves these where they put them.
+  const pinnedRef = useRef<Set<string>>(new Set());
+  const retidy = useCallback(() => {
+    pinnedRef.current = new Set();
+    requestReflow();
+  }, [requestReflow]);
 
   useEffect(() => {
     setRepo(new URLSearchParams(window.location.search).get("repo"));
@@ -327,7 +336,6 @@ export default function ArchitecturePage() {
         id: c.id,
         type: "archComponent",
         position: { x: col * COL_WIDTH, y: row * 170 },
-        draggable: false,
         data: {
           name: c.name,
           layer: c.layer,
@@ -355,6 +363,7 @@ export default function ArchitecturePage() {
       labelBgStyle: { fill: "#111113" },
     }));
 
+    pinnedRef.current = new Set(); // fresh graph → clear any manual positions
     setNodes(nextNodes);
     setEdges(nextEdges);
     // Tighten the columns once React Flow has measured the cards.
@@ -364,7 +373,7 @@ export default function ArchitecturePage() {
   // Reflow shortly after any height change so measurements have settled.
   useEffect(() => {
     if (status !== "ready") return;
-    const t = setTimeout(() => setNodes((cur) => relayout(cur)), 60);
+    const t = setTimeout(() => setNodes((cur) => relayout(cur, pinnedRef.current)), 60);
     return () => clearTimeout(t);
   }, [reflowTick, status, setNodes]);
 
@@ -440,8 +449,8 @@ export default function ArchitecturePage() {
               edges={edges}
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
+              onNodeDragStart={(_, node) => pinnedRef.current.add(node.id)}
               nodeTypes={nodeTypes}
-              nodesDraggable={false}
               colorMode="dark"
               fitView
               minZoom={0.2}
@@ -526,8 +535,18 @@ export default function ArchitecturePage() {
             </div>
 
             <div className="px-4 py-3">
-              <div className="mb-2 text-[10px] uppercase tracking-widest text-neutral-500">drill down</div>
+              <div className="mb-2 flex items-center justify-between">
+                <div className="text-[10px] uppercase tracking-widest text-neutral-500">interact</div>
+                <button
+                  onClick={retidy}
+                  title="Reset any dragged cards and re-stack the layout"
+                  className="rounded border border-panel-border px-1.5 py-0.5 text-[10px] text-neutral-400 transition-colors hover:border-neon hover:text-neon"
+                >
+                  ⤢ re-tidy
+                </button>
+              </div>
               <ol className="space-y-1 text-[11px] leading-relaxed text-neutral-400">
+                <li><span className="text-neutral-200">Drag a card</span> → reposition it freely.</li>
                 <li><span className="text-neutral-200">Click a component</span> → reveals its files.</li>
                 <li><span className="text-neutral-200">Click a file</span> → reveals its functions.</li>
                 <li><span className="text-neutral-200">Click a function</span> → reveals its source.</li>

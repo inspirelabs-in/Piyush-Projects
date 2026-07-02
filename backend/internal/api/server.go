@@ -137,7 +137,7 @@ func (s *Server) handlePrune(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "pruning engine not configured"})
 		return
 	}
-	rep, err := s.prune.Analyze(r.Context(), r.URL.Query().Get("repo"))
+	rep, err := s.prune.Analyze(r.Context(), r.URL.Query().Get("repo"), r.URL.Query().Get("refresh") == "true")
 	if err != nil {
 		log.Printf("prune error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to analyze repository"})

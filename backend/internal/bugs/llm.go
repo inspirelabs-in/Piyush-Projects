@@ -132,6 +132,7 @@ Respond with ONE JSON object, nothing else:
   "found": true,
   "title": "short, specific",
   "severity": "CRITICAL|HIGH|MEDIUM",
+  "confidence": "high|medium|low",
   "category": "logic|concurrency|security|resource_leak|error_handling",
   "location": { "file": "exact/path", "line_start": 0, "line_end": 0, "entity": "function or type name" },
   "finding": { "issue": "what is wrong, citing the code", "impact": "what breaks in production", "fix": "the concrete change" }
@@ -152,12 +153,13 @@ func (e *Engine) adversarial(ctx context.Context, root string, t target, g *grap
 		return Bug{}, false
 	}
 	var p struct {
-		Found    bool     `json:"found"`
-		Title    string   `json:"title"`
-		Severity string   `json:"severity"`
-		Category string   `json:"category"`
-		Location Location `json:"location"`
-		Finding  Finding  `json:"finding"`
+		Found      bool     `json:"found"`
+		Title      string   `json:"title"`
+		Severity   string   `json:"severity"`
+		Category   string   `json:"category"`
+		Confidence string   `json:"confidence"`
+		Location   Location `json:"location"`
+		Finding    Finding  `json:"finding"`
 	}
 	if err := json.Unmarshal([]byte(extractJSONObject(raw)), &p); err != nil {
 		return Bug{}, false
@@ -169,6 +171,10 @@ func (e *Engine) adversarial(ctx context.Context, root string, t target, g *grap
 	if _, ok := severityRank[sev]; !ok {
 		sev = "MEDIUM"
 	}
+	conf := strings.ToLower(strings.TrimSpace(p.Confidence))
+	if conf != "high" && conf != "medium" && conf != "low" {
+		conf = "medium"
+	}
 	loc := p.Location
 	if loc.File == "" {
 		loc.File = t.file
@@ -178,11 +184,12 @@ func (e *Engine) adversarial(ctx context.Context, root string, t target, g *grap
 		cat = "logic"
 	}
 	return Bug{
-		Title:    strings.TrimSpace(p.Title),
-		Severity: sev,
-		Category: cat,
-		Tier:     "llm",
-		Location: loc,
+		Title:      strings.TrimSpace(p.Title),
+		Severity:   sev,
+		Category:   cat,
+		Tier:       "llm",
+		Confidence: conf,
+		Location:   loc,
 		Finding: Finding{
 			Issue:  llm.CleanMarkdown(p.Finding.Issue),
 			Impact: llm.CleanMarkdown(p.Finding.Impact),

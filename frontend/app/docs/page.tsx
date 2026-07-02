@@ -3,25 +3,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { fetchDocs, type DocFunction, type DocSection, type RepoDocs } from "../workspace/lib/api";
+import { fetchDocs, type DocSection, type RepoDocs } from "../workspace/lib/api";
 import Markdown, { slugify } from "../workspace/components/Markdown";
 
 type TocItem = { id: string; text: string; level: number };
 
-// Map a file path to a highlight.js language hint for its code fences.
-function langOf(path: string): string {
-  if (/\.tsx?$/.test(path)) return "typescript";
-  if (/\.jsx?$/.test(path)) return "javascript";
-  if (/\.go$/.test(path)) return "go";
-  if (/\.rs$/.test(path)) return "rust";
-  if (/\.py$/.test(path)) return "python";
-  if (/\.(md|markdown|mdx)$/.test(path)) return "markdown";
-  if (/\.json$/.test(path)) return "json";
-  if (/\.sql$/.test(path)) return "sql";
-  if (/\.css$/.test(path)) return "css";
-  if (/\.(ya?ml)$/.test(path)) return "yaml";
-  return "";
-}
+// One-line explainers shown under each sidebar group so their purpose is clear.
+const GROUP_HINTS: Record<string, string> = {
+  Overview: "The big picture — what this project is, how it's built, and how it works.",
+  Subsystems: "Detailed, code-grounded deep-dive for each module in the codebase.",
+};
 
 export default function DocsPage() {
   const router = useRouter();
@@ -57,26 +48,21 @@ export default function DocsPage() {
     [docs, activeId],
   );
 
-  // Build the right-hand TOC once the active section is in the DOM.
+  // Build the right-hand TOC from the rendered section's headings.
   useEffect(() => {
-    if (!active) {
+    const el = contentRef.current;
+    if (!active || !el) {
       setToc([]);
       return;
     }
-    if (active.kind === "narrative") {
-      const el = contentRef.current;
-      if (!el) return;
-      const heads = Array.from(el.querySelectorAll("h2, h3")) as HTMLElement[];
-      setToc(
-        heads.map((h) => {
-          const id = slugify(h.textContent ?? "");
-          h.id = id;
-          return { id, text: h.textContent ?? "", level: h.tagName === "H2" ? 2 : 3 };
-        }),
-      );
-    } else {
-      setToc((active.files ?? []).map((f) => ({ id: "file-" + slugify(f.path), text: f.path, level: 2 })));
-    }
+    const heads = Array.from(el.querySelectorAll("h2, h3")) as HTMLElement[];
+    setToc(
+      heads.map((h) => {
+        const id = slugify(h.textContent ?? "");
+        h.id = id;
+        return { id, text: h.textContent ?? "", level: h.tagName === "H2" ? 2 : 3 };
+      }),
+    );
   }, [active]);
 
   const groups = useMemo(() => {
@@ -167,13 +153,19 @@ export default function DocsPage() {
           <nav className="w-60 shrink-0 overflow-y-auto border-r border-panel-border bg-panel/40 px-3 py-4">
             {groups.map(([group, sections]) => (
               <div key={group} className="mb-4">
-                <div className="mb-1.5 px-2 text-[10px] font-semibold uppercase tracking-widest text-neutral-600">
-                  {group}
+                <div className="mb-1.5 px-2">
+                  <div className="text-[10px] font-semibold uppercase tracking-widest text-neutral-600">
+                    {group}
+                  </div>
+                  {GROUP_HINTS[group] && (
+                    <div className="mt-0.5 text-[10px] leading-snug text-neutral-700">{GROUP_HINTS[group]}</div>
+                  )}
                 </div>
                 {sections.map((s) => (
                   <button
                     key={s.id}
                     onClick={() => selectSection(s.id)}
+                    title={s.title}
                     className={
                       "block w-full truncate rounded-md px-2 py-1.5 text-left font-mono text-[12px] transition-colors " +
                       (s.id === activeId
@@ -191,35 +183,7 @@ export default function DocsPage() {
           {/* Main content */}
           <main className="min-w-0 flex-1 overflow-y-auto">
             <div ref={contentRef} className="mx-auto max-w-3xl px-8 py-8">
-              {active?.kind === "narrative" ? (
-                <Markdown>{active.content ?? ""}</Markdown>
-              ) : (
-                <div>
-                  <h1 className="mb-1 text-[26px] font-bold tracking-tight text-neutral-50">{active?.title}</h1>
-                  <p className="mb-7 text-[12.5px] text-neutral-500">
-                    API reference derived directly from the parsed AST — {active?.files?.length ?? 0} file(s).
-                  </p>
-                  {active?.files?.map((f) => (
-                    <section key={f.path} id={"file-" + slugify(f.path)} className="mb-8 scroll-mt-20">
-                      <h2 className="mb-2.5 flex flex-wrap items-center gap-2 border-b border-panel-border/60 pb-1.5 font-mono text-[13.5px] text-neutral-100">
-                        <span className="text-neon">▸</span>
-                        <span className="break-all">{f.path}</span>
-                        <span className="ml-auto rounded-full bg-neutral-900 px-2 py-0.5 text-[10px] text-neutral-500">
-                          {f.functions.length} symbol{f.functions.length === 1 ? "" : "s"}
-                        </span>
-                      </h2>
-                      {f.functions.length === 0 && (
-                        <p className="pl-4 text-[12px] text-neutral-600">No exported symbols.</p>
-                      )}
-                      <div className="space-y-1.5">
-                        {f.functions.map((fn) => (
-                          <FunctionEntry key={fn.symbol + fn.start_line} fn={fn} lang={langOf(f.path)} />
-                        ))}
-                      </div>
-                    </section>
-                  ))}
-                </div>
-              )}
+              <Markdown>{active?.content ?? ""}</Markdown>
             </div>
           </main>
 
@@ -248,33 +212,6 @@ export default function DocsPage() {
               </>
             )}
           </aside>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// FunctionEntry — one reference symbol; reveals syntax-highlighted source on
-// click. The code is only rendered (and highlighted) while expanded, so a large
-// reference page with many symbols stays fast.
-function FunctionEntry({ fn, lang }: { fn: DocFunction; lang: string }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="overflow-hidden rounded-lg border border-panel-border bg-neutral-950/60">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-[12px] transition-colors hover:bg-neutral-900/50"
-      >
-        <span className="font-mono text-indigo-300">{fn.symbol}</span>
-        <span className="rounded bg-neutral-900 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-neutral-500">
-          {fn.chunk_type}
-        </span>
-        <span className="ml-auto font-mono text-[10px] text-neutral-600">L{fn.start_line}</span>
-        <span className="select-none text-[9px] text-neutral-500">{open ? "▾" : "▸"}</span>
-      </button>
-      {open && (
-        <div className="border-t border-panel-border px-3 pb-1 [&_pre]:my-2 [&_pre]:max-h-80">
-          <Markdown>{"```" + lang + "\n" + fn.code + "\n```"}</Markdown>
         </div>
       )}
     </div>

@@ -46,14 +46,22 @@ type Finding struct {
 
 // Bug is one detected defect (Tier-1 deterministic or Tier-2 LLM).
 type Bug struct {
-	BugID        string   `json:"bug_id"`   // SYN-YYYY-XXX
+	BugID        string   `json:"bug_id"` // SYN-YYYY-XXX
 	Title        string   `json:"title"`
-	Severity     string   `json:"severity"` // CRITICAL | HIGH | MEDIUM
-	Category     string   `json:"category"` // circular_dependency | resource_leak | logic | concurrency | security | ...
-	Tier         string   `json:"tier"`     // deterministic | llm
+	Severity     string   `json:"severity"`   // CRITICAL | HIGH | MEDIUM | LOW
+	Category     string   `json:"category"`   // circular_dependency | resource_leak | bad_practice | security | logic | concurrency | ...
+	Tier         string   `json:"tier"`       // deterministic | verified | llm
+	Confidence   string   `json:"confidence"` // high | medium | low
 	Location     Location `json:"location"`
 	Finding      Finding  `json:"finding"`
 	ContextNodes []string `json:"context_nodes"`
+}
+
+// candidate is a heuristic finding plus the source needed to verify it. Only
+// confirmed candidates (or, without an LLM, low-confidence ones) become Bugs.
+type candidate struct {
+	bug  Bug
+	code string
 }
 
 // Report is the full scan for a repo.
@@ -115,19 +123,37 @@ func (e *Engine) Scan(ctx context.Context, root string, refresh bool) (*Report, 
 		rep.Summary[b.Severity]++
 	}
 
-	// --- Tier 1: deterministic graph + code scans ----------------------------
+	llmOn := e.LLM && e.Chat != nil
+
+	// --- Tier 1: deterministic scans -----------------------------------------
+	// Circular deps are graph-precise → reported directly at high confidence.
 	for _, c := range detectCycles(g) {
 		add(c)
 	}
-	for _, l := range detectResourceLeaks(funcs) {
-		add(l)
+	// Resource leaks + bad practices are HEURISTIC candidates: cast a wide net,
+	// then confirm each against its real code with the LLM so false positives are
+	// dropped and survivors get an accurate severity/confidence. Without an LLM,
+	// they're reported as low-confidence, clearly labelled as unverified.
+	cands := append(detectResourceLeaks(funcs), detectBadPractices(funcs)...)
+	verified := 0
+	if llmOn {
+		for _, b := range e.verifyCandidates(ctx, cands) {
+			add(b)
+			verified++
+		}
+	} else {
+		for _, c := range cands {
+			c.bug.Confidence = "low"
+			c.bug.Finding.Issue = "[unverified] " + c.bug.Finding.Issue
+			add(c.bug)
+		}
 	}
 
-	tier1 := len(rep.Bugs)
+	tier12 := len(rep.Bugs)
 
 	// --- Tier 2: adversarial LLM analysis of the riskiest nodes --------------
 	analyzed := 0
-	if e.LLM && e.Chat != nil {
+	if llmOn {
 		targets := e.pickTargets(g, funcs, rep.Bugs)
 		analyzed = len(targets)
 		for _, t := range targets {
@@ -138,12 +164,12 @@ func (e *Engine) Scan(ctx context.Context, root string, refresh bool) (*Report, 
 	}
 
 	sortBugs(rep.Bugs)
-	rep.Notes = g.notes(e.LLM && e.Chat != nil)
+	rep.Notes = g.notes(llmOn)
 	if rep.Bugs == nil {
 		rep.Bugs = []Bug{}
 	}
-	log.Printf("bugs: %s — %d findings (tier1=%d, tier2=%d from %d nodes analyzed) over %d files",
-		rep.Name, len(rep.Bugs), tier1, len(rep.Bugs)-tier1, analyzed, rep.Scanned)
+	log.Printf("bugs: %s — %d findings (%d candidates → %d verified, tier2=%d from %d nodes) over %d files",
+		rep.Name, len(rep.Bugs), len(cands), verified, len(rep.Bugs)-tier12, analyzed, rep.Scanned)
 
 	e.mu.Lock()
 	e.cache[root] = rep
@@ -207,13 +233,14 @@ func buildGraph(files []store.FileRow, rels []store.RelRow) *graph {
 }
 
 func (g *graph) notes(llmOn bool) []string {
-	n := []string{
-		"Findings are candidates: deterministic scans are heuristic and the adversarial LLM can be wrong — review before acting.",
-	}
 	if !llmOn {
-		n = append(n, "Tier 2 (LLM adversarial analysis) is disabled — only deterministic graph/code scans ran. Configure an LLM provider + SYNAPSE_BUGS_LLM=true for deep logic/security review.")
+		return []string{
+			"Heuristic candidates are shown UNVERIFIED (low confidence) — the LLM verification pass is disabled. Configure an LLM provider + SYNAPSE_BUGS_LLM=true so each finding is confirmed against its real code and false positives are dropped.",
+		}
 	}
-	return n
+	return []string{
+		"Resource-leak and bad-practice findings were confirmed against their actual source by an LLM verification pass; circular dependencies are graph-exact. Even so, review before acting — verification is not infallible.",
+	}
 }
 
 // --- Tier 1a: circular dependencies (Tarjan SCC) ----------------------------
@@ -227,10 +254,11 @@ func detectCycles(g *graph) []Bug {
 		}
 		sort.Strings(comp)
 		b := Bug{
-			Severity: "HIGH",
-			Category: "circular_dependency",
-			Tier:     "deterministic",
-			Location: Location{File: comp[0], Entity: "module import cycle"},
+			Severity:   "HIGH",
+			Category:   "circular_dependency",
+			Tier:       "deterministic",
+			Confidence: "high", // graph-precise: a real SCC is a real cycle
+			Location:   Location{File: comp[0], Entity: "module import cycle"},
 			Finding: Finding{
 				Impact: "Cycles cause fragile initialization order, hinder tree-shaking/testing, and can deadlock or leak at startup. In Go they won't compile; in TS/JS they yield undefined-at-import-time bugs.",
 				Fix:    "Break the loop by extracting the shared types/utilities into a leaf module that all of these import, or invert one dependency (depend on an interface, not a concrete module).",
@@ -376,20 +404,54 @@ var leakRules = []leakRule{
 	},
 }
 
-func detectResourceLeaks(funcs []store.FuncCodeRow) []Bug {
-	// Reassemble whole functions (chunk splits) per file+symbol.
-	type fn struct {
-		file, symbol, lang, code string
-		start, end               int
+func detectResourceLeaks(funcs []store.FuncCodeRow) []candidate {
+	var cands []candidate
+	for _, f := range reassembleFuncs(funcs) {
+		lang := langOf(f.file)
+		for _, rule := range leakRules {
+			if !rule.langs[lang] {
+				continue
+			}
+			if rule.alloc.MatchString(f.code) && !rule.release.MatchString(f.code) {
+				cands = append(cands, candidate{
+					code: f.code,
+					bug: Bug{
+						Title:      "Possible resource leak: " + rule.name,
+						Severity:   "MEDIUM",
+						Category:   "resource_leak",
+						Tier:       "deterministic",
+						Confidence: "medium",
+						Location:   Location{File: f.file, Entity: f.symbol, LineStart: f.start, LineEnd: f.end},
+						Finding: Finding{
+							Issue:  fmt.Sprintf("`%s` opens %s but no matching release (`%s`) is visible in its body.", f.symbol, rule.what, releaseHint(rule)),
+							Impact: "Unreleased resources accumulate under load — exhausting the connection pool / file descriptors / memory and eventually stalling the service.",
+							Fix:    "Release it on every path — `defer x.Close()` (Go) right after acquiring, or a cleanup in the effect's teardown (JS). Verify the resource isn't returned to a caller that owns closing it.",
+						},
+						ContextNodes: []string{f.file},
+					},
+				})
+				break // one leak finding per function is enough
+			}
+		}
 	}
-	byKey := map[string]*fn{}
+	return cands
+}
+
+// funcBody is a whole function reassembled from its (possibly split) chunks.
+type funcBody struct {
+	file, symbol, code string
+	start, end         int
+}
+
+// reassembleFuncs merges #partN chunk splits back into whole function bodies.
+func reassembleFuncs(funcs []store.FuncCodeRow) []funcBody {
+	byKey := map[string]*funcBody{}
 	var order []string
 	for _, r := range funcs {
-		base := baseSym(r.Symbol)
-		key := r.File + "\x00" + base
+		key := r.File + "\x00" + baseSym(r.Symbol)
 		f, ok := byKey[key]
 		if !ok {
-			f = &fn{file: r.File, symbol: base, start: r.StartLine, end: r.EndLine}
+			f = &funcBody{file: r.File, symbol: baseSym(r.Symbol), start: r.StartLine, end: r.EndLine}
 			byKey[key] = f
 			order = append(order, key)
 		}
@@ -401,34 +463,11 @@ func detectResourceLeaks(funcs []store.FuncCodeRow) []Bug {
 			f.end = r.EndLine
 		}
 	}
-
-	var bugs []Bug
-	for _, key := range order {
-		f := byKey[key]
-		lang := langOf(f.file)
-		for _, rule := range leakRules {
-			if !rule.langs[lang] {
-				continue
-			}
-			if rule.alloc.MatchString(f.code) && !rule.release.MatchString(f.code) {
-				bugs = append(bugs, Bug{
-					Title:    "Possible resource leak: " + rule.name,
-					Severity: "MEDIUM",
-					Category: "resource_leak",
-					Tier:     "deterministic",
-					Location: Location{File: f.file, Entity: f.symbol, LineStart: f.start, LineEnd: f.end},
-					Finding: Finding{
-						Issue:  fmt.Sprintf("`%s` opens %s but no matching release (`%s`) is visible in its body.", f.symbol, rule.what, releaseHint(rule)),
-						Impact: "Unreleased resources accumulate under load — exhausting the connection pool / file descriptors / memory and eventually stalling the service.",
-						Fix:    "Release it on every path — `defer x.Close()` (Go) right after acquiring, or a cleanup in the effect's teardown (JS). Verify the resource isn't returned to a caller that owns closing it.",
-					},
-					ContextNodes: []string{f.file},
-				})
-				break // one leak finding per function is enough
-			}
-		}
+	out := make([]funcBody, 0, len(order))
+	for _, k := range order {
+		out = append(out, *byKey[k])
 	}
-	return bugs
+	return out
 }
 
 func releaseHint(r leakRule) string {
@@ -475,7 +514,7 @@ func langOf(file string) string {
 	}
 }
 
-var severityRank = map[string]int{"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2}
+var severityRank = map[string]int{"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
 
 func sortBugs(bs []Bug) {
 	sort.SliceStable(bs, func(i, j int) bool {

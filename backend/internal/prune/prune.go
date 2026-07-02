@@ -13,7 +13,9 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 
+	"project-synapse/backend/internal/llm"
 	"project-synapse/backend/internal/store"
 )
 
@@ -42,17 +44,37 @@ type Report struct {
 	Notes       []string       `json:"notes"`   // caveats (dynamic imports, language coverage)
 }
 
-// Engine builds pruning reports from the store's AST graph.
+// Engine builds pruning reports from the store's AST graph. When Chat is set and
+// Verify is true, an LLM pass reviews file-level candidates to drop
+// framework-invoked / dynamically-loaded false positives.
 type Engine struct {
-	Store *store.Store
+	Store  *store.Store
+	Chat   llm.ChatClient // optional — enables the verification pass
+	Verify bool
+
+	mu    sync.Mutex
+	cache map[string]*Report
 }
 
-// Analyze runs the full multi-signal dead-code analysis for a repo root,
-// fetching the AST graph from the store.
-func (e *Engine) Analyze(ctx context.Context, root string) (*Report, error) {
+// Analyze runs the full multi-signal dead-code analysis for a repo root, fetching
+// the AST graph from the store. The result (including the LLM verification pass)
+// is cached per root; pass refresh=true to recompute.
+func (e *Engine) Analyze(ctx context.Context, root string, refresh bool) (*Report, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("repo is required")
 	}
+	e.mu.Lock()
+	if e.cache == nil {
+		e.cache = map[string]*Report{}
+	}
+	if !refresh {
+		if r, ok := e.cache[root]; ok {
+			e.mu.Unlock()
+			return r, nil
+		}
+	}
+	e.mu.Unlock()
+
 	files, err := e.Store.FilesByRoot(ctx, root)
 	if err != nil {
 		return nil, err
@@ -63,7 +85,15 @@ func (e *Engine) Analyze(ctx context.Context, root string) (*Report, error) {
 	rels, _ := e.Store.RelationshipsByRoot(ctx, root)
 	calls, _ := e.Store.CallsByRoot(ctx, root)
 	decls, _ := e.Store.DeclarationsByRoot(ctx, root)
-	return analyze(root, files, rels, calls, decls), nil
+	rep := analyze(root, files, rels, calls, decls)
+	if e.Chat != nil && e.Verify {
+		e.verify(ctx, rep, rels)
+	}
+
+	e.mu.Lock()
+	e.cache[root] = rep
+	e.mu.Unlock()
+	return rep, nil
 }
 
 // analyze is the pure analysis over already-fetched graph data (store-free, so it

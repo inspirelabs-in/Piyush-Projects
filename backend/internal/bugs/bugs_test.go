@@ -1,6 +1,7 @@
 package bugs
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -68,23 +69,75 @@ func TestDetectResourceLeaks(t *testing.T) {
 		{File: "store.go", Symbol: "OpenTx", StartLine: 11, EndLine: 14,
 			Code: "func OpenTx(db *sql.DB) {\n\ttx, _ := db.Begin()\n\t_ = tx\n}"}, // no Commit/Rollback
 	}
-	bugs := detectResourceLeaks(funcs)
+	cands := detectResourceLeaks(funcs)
 
 	got := map[string]bool{}
-	for _, b := range bugs {
-		if b.Category != "resource_leak" {
-			t.Errorf("unexpected category: %+v", b)
+	for _, c := range cands {
+		if c.bug.Category != "resource_leak" {
+			t.Errorf("unexpected category: %+v", c.bug)
 		}
-		got[b.Location.Entity] = true
+		if c.code == "" {
+			t.Errorf("candidate should carry its code for verification: %+v", c.bug)
+		}
+		got[c.bug.Location.Entity] = true
 	}
 	if !got["Leaky"] {
-		t.Errorf("Leaky (rows never Closed) should be flagged; bugs=%+v", bugs)
+		t.Errorf("Leaky (rows never Closed) should be flagged; cands=%+v", cands)
 	}
 	if !got["OpenTx"] {
 		t.Errorf("OpenTx (tx never Committed/Rolled back) should be flagged")
 	}
 	if got["Safe"] {
 		t.Errorf("Safe (defer rows.Close()) must NOT be flagged")
+	}
+}
+
+func TestDetectBadPractices(t *testing.T) {
+	funcs := []store.FuncCodeRow{
+		{File: "auth.ts", Symbol: "login", StartLine: 1, EndLine: 3,
+			Code: "async function login() {\n  const apiKey = \"sk-live-ABCDEFGH1234567890\";\n}"},
+		{File: "run.ts", Symbol: "run", StartLine: 1, EndLine: 4,
+			Code: "function run(s: string) {\n  try { doWork(); } catch {}\n  eval(s);\n}"},
+		{File: "clean.ts", Symbol: "clean", StartLine: 1, EndLine: 3,
+			Code: "function clean() {\n  try { doWork(); } catch (e) { logger.error(e); throw e; }\n}"},
+	}
+	byCat := map[string]int{}
+	entities := map[string]bool{}
+	for _, c := range detectBadPractices(funcs) {
+		byCat[c.bug.Category]++
+		entities[c.bug.Location.Entity] = true
+	}
+	if byCat["security"] < 2 { // hardcoded secret + eval
+		t.Errorf("expected >=2 security findings (secret + eval), got %d", byCat["security"])
+	}
+	if byCat["bad_practice"] < 1 { // empty catch
+		t.Errorf("expected an empty-catch bad_practice finding, got %d", byCat["bad_practice"])
+	}
+	if entities["clean"] {
+		t.Errorf("clean() has a proper catch and no anti-patterns — must NOT be flagged")
+	}
+}
+
+// confirmChat is a mock that confirms candidate id 0 and rejects the rest.
+type confirmChat struct{}
+
+func (confirmChat) Name() string { return "mock" }
+func (confirmChat) Complete(_ context.Context, _, _ string) (string, error) {
+	return `{"verdicts":[{"id":0,"confirmed":true,"severity":"HIGH","confidence":"high","title":"Confirmed leak","issue":"real","impact":"bad","fix":"close it"},{"id":1,"confirmed":false}]}`, nil
+}
+
+func TestVerifyCandidatesKeepsOnlyConfirmed(t *testing.T) {
+	e := &Engine{Chat: confirmChat{}}
+	cands := []candidate{
+		{code: "func A(){}", bug: Bug{Category: "resource_leak", Severity: "MEDIUM", Location: Location{File: "a.go", Entity: "A"}, Finding: Finding{Issue: "x"}}},
+		{code: "func B(){}", bug: Bug{Category: "resource_leak", Severity: "MEDIUM", Location: Location{File: "b.go", Entity: "B"}, Finding: Finding{Issue: "y"}}},
+	}
+	out := e.verifyCandidates(context.Background(), cands)
+	if len(out) != 1 {
+		t.Fatalf("verify should keep only the confirmed candidate, got %d", len(out))
+	}
+	if out[0].Tier != "verified" || out[0].Severity != "HIGH" || out[0].Title != "Confirmed leak" {
+		t.Errorf("verdict not applied: %+v", out[0])
 	}
 }
 

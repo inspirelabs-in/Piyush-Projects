@@ -145,11 +145,37 @@ func main() {
 		GitBin:    cfg.GitBin,
 	}
 
-	docsEngine := &docs.Engine{Store: db, Chat: chat}
-	archEngine := &architecture.Engine{Store: db, Chat: chat}
+	// Per-engine model selection. Docs / architecture / bug analysis are heavier
+	// reasoning tasks and can run on a stronger model (SYNAPSE_DOCS_MODEL /
+	// SYNAPSE_ARCH_MODEL / SYNAPSE_BUGS_MODEL), while the assistant (RAG),
+	// blueprint discovery, tours, and enrichment use the base SYNAPSE_LLM_MODEL.
+	// Clients are cached per model so identical overrides share one instance.
+	chatCache := map[string]llm.ChatClient{cfg.LLMModel: chat}
+	chatFor := func(model string) llm.ChatClient {
+		if model == "" || model == cfg.LLMModel {
+			return chat
+		}
+		if c, ok := chatCache[model]; ok {
+			return c
+		}
+		c, cerr := llm.NewChatClient(llm.Config{
+			Provider: cfg.LLMProvider, Model: model,
+			AnthropicKey: cfg.AnthropicKey, OpenAIKey: cfg.OpenAIKey, OpenAIBase: cfg.OpenAIBase,
+			OpenRouterKey: cfg.OpenRouterKey, OpenRouterBase: cfg.OpenRouterBase, OllamaHost: cfg.OllamaHost,
+		})
+		if cerr != nil || c == nil {
+			return chat // fall back to the base client
+		}
+		chatCache[model] = c
+		log.Printf("llm[%s]: %s", model, c.Name())
+		return c
+	}
+
+	docsEngine := &docs.Engine{Store: db, Chat: chatFor(cfg.DocsModel)}
+	archEngine := &architecture.Engine{Store: db, Chat: chatFor(cfg.ArchModel)}
 	axonEngine := &axon.Engine{Store: db, Chat: chat}
-	pruneEngine := &prune.Engine{Store: db}
-	bugsEngine := &bugs.Engine{Store: db, Embedder: queryEmbedder, Chat: chat, LLM: cfg.BugsLLM, MaxLLM: cfg.BugsMaxLLM}
+	pruneEngine := &prune.Engine{Store: db, Chat: chatFor(cfg.BugsModel), Verify: cfg.PruneVerify}
+	bugsEngine := &bugs.Engine{Store: db, Embedder: queryEmbedder, Chat: chatFor(cfg.BugsModel), LLM: cfg.BugsLLM, MaxLLM: cfg.BugsMaxLLM}
 
 	srv := api.NewHTTPServer(cfg.HTTPAddr, db, orch, bp, ingestHandler, docsEngine, archEngine, axonEngine, pruneEngine, bugsEngine)
 	if err := api.Run(ctx, srv); err != nil {

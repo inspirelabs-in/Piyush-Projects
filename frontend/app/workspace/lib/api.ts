@@ -289,26 +289,11 @@ export async function fetchPathway(repo: string, signal?: AbortSignal): Promise<
 
 // --- Documentation ----------------------------------------------------------
 
-export interface DocFunction {
-  symbol: string;
-  chunk_type: string;
-  start_line: number;
-  end_line: number;
-  code: string;
-}
-
-export interface DocFile {
-  path: string;
-  functions: DocFunction[];
-}
-
 export interface DocSection {
   id: string;
   title: string;
-  kind: "narrative" | "module";
-  group: string;
-  content?: string; // markdown, for narrative sections
-  files?: DocFile[]; // for module/reference sections
+  group: string; // sidebar grouping
+  content: string; // markdown
 }
 
 export interface RepoDocs {
@@ -436,9 +421,10 @@ export interface BugFinding {
 export interface Bug {
   bug_id: string; // SYN-YYYY-NNN
   title: string;
-  severity: string; // CRITICAL | HIGH | MEDIUM
-  category: string; // circular_dependency | resource_leak | logic | concurrency | security | ...
-  tier: string; // deterministic | llm
+  severity: string; // CRITICAL | HIGH | MEDIUM | LOW
+  category: string; // circular_dependency | resource_leak | bad_practice | security | logic | concurrency | ...
+  tier: string; // deterministic | verified | llm
+  confidence: string; // high | medium | low
   location: BugLocation;
   finding: BugFinding;
   context_nodes: string[];
