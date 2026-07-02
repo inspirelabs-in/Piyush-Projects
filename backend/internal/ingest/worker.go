@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"log"
 	"os"
@@ -129,6 +130,14 @@ func (pl *Pipeline) worker(ctx context.Context, id int, root string, known *pars
 		if err != nil {
 			log.Printf("[worker %d] read %s: %v", id, rel, err)
 			atomic.AddInt64(&stats.Errors, 1)
+			continue
+		}
+
+		// Skip binary files: a NUL byte means it isn't text source (a stray image,
+		// AppleDouble sidecar, etc.). Postgres text columns reject 0x00, so this
+		// also prevents "invalid byte sequence for encoding UTF8" persist errors.
+		if bytes.IndexByte(content, 0) >= 0 {
+			log.Printf("[worker %d] skip %s: binary (contains NUL bytes)", id, rel)
 			continue
 		}
 

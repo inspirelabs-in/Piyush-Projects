@@ -36,6 +36,7 @@ var skipDirs = map[string]bool{
 	"out":          true,
 	"vendor":       true, // Go vendored deps
 	"target":       true, // Rust/Cargo build output
+	"__MACOSX":     true, // AppleDouble metadata from macOS-created zips
 }
 
 // maxFileBytes skips oversized files — almost always minified/generated bundles
@@ -76,6 +77,13 @@ func Walk(root string, out chan<- string) error {
 			if skipDirs[d.Name()] {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+
+		// Skip macOS AppleDouble sidecar files (`._Foo.tsx`) — binary resource-fork
+		// metadata that carries a source extension but is NOT source (and contains
+		// NUL bytes that Postgres text columns reject).
+		if strings.HasPrefix(d.Name(), "._") {
 			return nil
 		}
 
