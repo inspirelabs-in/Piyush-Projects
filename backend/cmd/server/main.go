@@ -75,6 +75,16 @@ func main() {
 	}
 	log.Printf("embedder: %s (dim=%d)", embedder.Name(), embedder.Dimensions())
 
+	// Reconcile the vector schema to the active embedder. Lets you switch model /
+	// dimension purely via .env (SYNAPSE_EMBED_MODEL / SYNAPSE_EMBED_DIM): on any
+	// change, the vector_chunks column + HNSW index are re-typed and stale vectors
+	// cleared automatically — just re-ingest afterwards.
+	if action, rerr := db.ReconcileEmbedding(ctx, embedder.Name(), embedder.Dimensions()); rerr != nil {
+		log.Fatalf("embedding schema reconcile: %v", rerr)
+	} else if action != "" {
+		log.Printf("embedding: %s", action)
+	}
+
 	// Chat client (answer synthesis); nil => offline template responder.
 	chat, err := llm.NewChatClient(llm.Config{
 		Provider:       cfg.LLMProvider,

@@ -87,7 +87,7 @@ func Load() Config {
 		Enrich:        getEnvBool("SYNAPSE_ENRICH", true),
 		EmbedProvider: getEnv("SYNAPSE_EMBED_PROVIDER", "auto"),
 		EmbedModel:    getEnv("SYNAPSE_EMBED_MODEL", ""),
-		EmbedDim:      getEnvInt("SYNAPSE_EMBED_DIM", 1536),
+		EmbedDim:      getEnvInt("SYNAPSE_EMBED_DIM", 1024),
 		JinaKey:       getEnv("JINA_API_KEY", ""),
 		JinaBase:      getEnv("JINA_BASE_URL", ""),
 		VoyageKey:     getEnv("VOYAGE_API_KEY", ""),

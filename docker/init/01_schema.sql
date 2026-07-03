@@ -78,9 +78,12 @@ CREATE INDEX IF NOT EXISTS idx_ast_rel_target    ON ast_relationships (target_sy
 -- ----------------------------------------------------------------------------
 -- vector_chunks
 --   Semantic layer. Each chunk is a structurally-bounded slice of code (a
---   function/class body) OR a markdown section. Dimension 768 matches Google
---   gemini-embedding-001 (outputDimensionality=768, L2-normalized); adjust here +
---   the Go ingest layer (SYNAPSE_EMBED_DIM) if you swap models. chunk_type
+--   function/class body) OR a markdown section. Dimension 1024 matches the
+--   configured embedder (Ollama mxbai-embed-large / Voyage voyage-code-3 /
+--   OpenAI text-embedding-3-* with dimensions=1024). This VALUE MUST EQUAL the Go
+--   ingest layer's SYNAPSE_EMBED_DIM — if you swap to a 768-dim model (Jina
+--   jina-embeddings-v2-base-code, nomic-embed-text), change VECTOR(1024) below to
+--   VECTOR(768) AND set SYNAPSE_EMBED_DIM=768 (and rebuild the HNSW index). chunk_type
 --   "myelin_doc" tags markdown sections so human docs blend seamlessly into
 --   hybrid-RAG search (Myelin Insulation).
 -- ----------------------------------------------------------------------------
@@ -92,7 +95,7 @@ CREATE TABLE IF NOT EXISTS vector_chunks (
     start_line  INTEGER      NOT NULL DEFAULT 0,
     end_line    INTEGER      NOT NULL DEFAULT 0,
     content     TEXT         NOT NULL,
-    embedding   VECTOR(768),                       -- nullable until embeddings are computed (gemini-embedding-001 @ 768d)
+    embedding   VECTOR(1024),                      -- nullable until embeddings are computed; MUST match SYNAPSE_EMBED_DIM
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
@@ -107,6 +110,21 @@ CREATE INDEX IF NOT EXISTS idx_vector_chunks_embedding_hnsw
     ON vector_chunks
     USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
+
+-- ----------------------------------------------------------------------------
+-- embed_config
+--   Single-row bookkeeping of the embedder (model + dim) that currently populates
+--   vector_chunks. The backend reconciles the embedding column + HNSW index to the
+--   active SYNAPSE_EMBED_MODEL / SYNAPSE_EMBED_DIM on startup (see store.Recon-
+--   cileEmbedding); this row lets it detect a model/dim change across restarts.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS embed_config (
+    id         INT         PRIMARY KEY DEFAULT 1,
+    model      TEXT        NOT NULL DEFAULT '',
+    dim        INT         NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT embed_config_singleton CHECK (id = 1)
+);
 
 -- ----------------------------------------------------------------------------
 -- updated_at maintenance for code_files.

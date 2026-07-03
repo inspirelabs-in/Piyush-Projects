@@ -17,12 +17,13 @@ import {
   type QueryAnswer,
   type RepoInfo,
 } from "./lib/api";
-import WorkspaceCanvas from "./components/WorkspaceCanvas";
+import GraphView from "./components/GraphView";
 import ChatPanel from "./components/ChatPanel";
 import ExecutionDock from "./components/ExecutionDock";
 import BlueprintPanel from "./components/BlueprintPanel";
 import RepoSelector from "./components/RepoSelector";
 import TourOverlay from "./components/TourOverlay";
+import TourLoading from "./components/TourLoading";
 
 type Tab = "assistant" | "blueprint";
 
@@ -140,6 +141,11 @@ export default function WorkspacePage() {
     setSelectedLabel(label);
   }, []);
 
+  // Clicking empty canvas clears the query spotlight so the graph reads neutral.
+  const handleClearHighlight = useCallback(() => {
+    setHighlightedFiles([]);
+  }, []);
+
   // Focus a single file on the canvas (used when clicking a function in the chat).
   const handleFocusFile = useCallback((file: string) => {
     setHighlightedFiles([file]);
@@ -247,7 +253,14 @@ export default function WorkspacePage() {
             className={toolBtn}
             title="Start onboarding tour along the Axon dependency pathway"
           >
-            {tourBusy ? "…" : "▶ Tour"}
+            {tourBusy ? (
+              <span className="flex items-center gap-1.5">
+                <span className="inline-block h-2.5 w-2.5 animate-spin rounded-full border border-accent border-t-transparent" />
+                Charting…
+              </span>
+            ) : (
+              "▶ Tour"
+            )}
           </button>
           {activeRepo && (
             <div className="flex items-center overflow-hidden rounded-md border border-panel-border">
@@ -312,7 +325,7 @@ export default function WorkspacePage() {
             </div>
           ) : (
             <>
-              <WorkspaceCanvas
+              <GraphView
                 graph={graph}
                 highlightedFiles={highlightedFiles}
                 focusNonce={focusNonce}
@@ -321,8 +334,13 @@ export default function WorkspacePage() {
                 functions={tab === "blueprint" ? [] : canvasFunctions}
                 callEdges={tab === "blueprint" ? [] : canvasCalls}
                 onExpandFile={handleExpandFile}
+                onClearHighlight={handleClearHighlight}
+                tourActive={tourBusy || tour !== null}
                 perspective={perspective}
               />
+
+              {/* Computing the pathway (LLM pass) — keep the user informed */}
+              {tourBusy && !tour && <TourLoading />}
 
               {/* Onboarding (Axon) tour overlay */}
               {tour && tourStep && (

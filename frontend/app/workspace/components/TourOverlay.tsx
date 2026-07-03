@@ -1,8 +1,11 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import type { AxonStep } from "../lib/api";
+
+// How long auto-play lingers on each step before flying to the next.
+const STEP_MS = 7000;
 
 // Role → colour / label / one-line "why you're here" hint. Keeps the tour legible
 // for someone who has never seen the codebase.
@@ -53,15 +56,38 @@ export default function TourOverlay({
   onExit,
   onFocusFile,
 }: TourOverlayProps) {
-  // Keyboard navigation: ← / → to move, Esc to exit. Feels geeky and is faster.
+  const [playing, setPlaying] = useState(false);
+
+  const step = steps[index];
+  const atStart = index === 0;
+  const atEnd = index === steps.length - 1;
+
+  // Auto-play: fly to the next step on a timer. Manual navigation resets it
+  // (the effect re-runs on `index`); reaching the end stops playback.
+  useEffect(() => {
+    if (!playing) return;
+    if (atEnd) {
+      setPlaying(false);
+      return;
+    }
+    const t = setTimeout(onNext, STEP_MS);
+    return () => clearTimeout(t);
+  }, [playing, index, atEnd, onNext]);
+
+  // Keyboard: ← / → move, Space toggles auto-play, Esc exits.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "ArrowRight") {
         e.preventDefault();
+        setPlaying(false);
         onNext();
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
+        setPlaying(false);
         onPrev();
+      } else if (e.key === " ") {
+        e.preventDefault();
+        setPlaying((p) => !p);
       } else if (e.key === "Escape") {
         e.preventDefault();
         onExit();
@@ -71,17 +97,30 @@ export default function TourOverlay({
     return () => window.removeEventListener("keydown", onKey);
   }, [onNext, onPrev, onExit]);
 
-  const step = steps[index];
   if (!step) return null;
 
   const color = ROLE_COLOR[step.role] ?? "#94a3b8";
-  const atStart = index === 0;
-  const atEnd = index === steps.length - 1;
   const fileName = step.file.split("/").pop();
 
   return (
     <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex justify-center px-3 pb-3 sm:px-4 sm:pb-4">
-      <div className="pointer-events-auto flex w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-panel-border bg-neutral-950/95 shadow-2xl ring-1 ring-black/40 backdrop-blur-xl">
+      <div className="axon-rise pointer-events-auto flex w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-panel-border bg-neutral-950/95 shadow-2xl ring-1 ring-black/40 backdrop-blur-xl">
+        {/* Progress strip — auto-play countdown, else overall completion */}
+        <div className="h-0.5 w-full bg-white/[0.05]">
+          {playing && !atEnd ? (
+            <div
+              key={index}
+              className="h-full"
+              style={{ backgroundColor: color, animation: `axon-progress ${STEP_MS}ms linear forwards` }}
+            />
+          ) : (
+            <div
+              className="h-full bg-accent/70 transition-[width] duration-500"
+              style={{ width: `${((index + 1) / steps.length) * 100}%` }}
+            />
+          )}
+        </div>
+
         {/* Terminal header + clickable step timeline */}
         <div className="flex items-center gap-2 border-b border-panel-border bg-black/50 px-3 py-2">
           <span className="hidden items-center gap-1.5 sm:flex">
@@ -168,6 +207,19 @@ export default function TourOverlay({
 
         {/* Footer navigation */}
         <div className="flex items-center gap-2 border-t border-panel-border bg-black/50 px-3 py-2">
+          <button
+            onClick={() => setPlaying((p) => !p)}
+            disabled={atEnd}
+            className={
+              "rounded-md border px-2.5 py-1 font-mono text-[11px] transition-colors disabled:cursor-not-allowed disabled:opacity-30 " +
+              (playing
+                ? "border-accent/60 bg-accent/10 text-accent"
+                : "border-panel-border bg-neutral-900 text-neutral-300 hover:border-accent hover:text-accent")
+            }
+            title={playing ? "Pause auto-play (Space)" : "Auto-play the tour (Space)"}
+          >
+            {playing ? "⏸ pause" : "▶ play"}
+          </button>
           <button onClick={onPrev} disabled={atStart} className={navBtn}>
             ‹ prev
           </button>
@@ -177,8 +229,8 @@ export default function TourOverlay({
           <span className="ml-auto hidden items-center gap-1.5 font-mono text-[10px] text-neutral-600 sm:flex">
             <Kbd>←</Kbd>
             <Kbd>→</Kbd>
-            navigate
-            {atEnd && <span className="ml-2 text-emerald-400">✓ end of pathway</span>}
+            <Kbd>space</Kbd>
+            {atEnd ? <span className="ml-2 text-emerald-400">✓ end of pathway</span> : "navigate"}
           </span>
           {atEnd && <span className="ml-auto font-mono text-[10px] text-emerald-400 sm:hidden">✓ end</span>}
         </div>
