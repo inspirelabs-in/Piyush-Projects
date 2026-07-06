@@ -86,7 +86,8 @@ func (pl *Pipeline) RunInto(ctx context.Context, root string, stats *Stats) erro
 		return err
 	}
 
-	known := parser.BuildIndexWithAliases(relPaths, loadTSConfigAliases(absRoot))
+	tsAliases, tsBaseDirs := loadTSConfigResolution(absRoot)
+	known := parser.BuildIndexWithConfig(relPaths, tsAliases, tsBaseDirs)
 	atomic.StoreInt64(&stats.FilesDiscovered, int64(len(relPaths)))
 	if len(relPaths) == 0 {
 		return nil

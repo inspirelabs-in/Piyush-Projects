@@ -1,18 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 
 import {
   deleteRepo,
-  fetchFileFunctions,
+  fetchFileSummary,
   fetchGraph,
   fetchPathway,
   fetchRepos,
   type AxonStep,
   type BlueprintResponse,
-  type CallEdge,
-  type FunctionHit,
   type GraphData,
   type QueryAnswer,
   type RepoInfo,
@@ -42,8 +40,10 @@ export default function WorkspacePage() {
   const [focusNonce, setFocusNonce] = useState(0);
   const [selectedLabel, setSelectedLabel] = useState<string | null>(null);
   const [blueprint, setBlueprint] = useState<BlueprintResponse | null>(null);
-  const [canvasFunctions, setCanvasFunctions] = useState<FunctionHit[]>([]);
-  const [canvasCalls, setCanvasCalls] = useState<CallEdge[]>([]);
+  // File detail panel: a short LLM summary of the clicked file.
+  const [fileSummary, setFileSummary] = useState<{ path: string; text: string } | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const summaryReqRef = useRef(0);
 
   // Cortex Perspective (executive/synaptic) + Axon onboarding tour.
   const [perspective, setPerspective] = useState<"synaptic" | "executive">("synaptic");
@@ -102,8 +102,8 @@ export default function WorkspacePage() {
     setExecutionFlow([]);
     setBlueprint(null);
     setSelectedLabel(null);
-    setCanvasFunctions([]);
-    setCanvasCalls([]);
+    setFileSummary(null);
+    setSummaryLoading(false);
     setTour(null);
   }, []);
 
@@ -132,8 +132,6 @@ export default function WorkspacePage() {
   const handleResult = useCallback((answer: QueryAnswer) => {
     setHighlightedFiles(answer.highlighted_files ?? []);
     setExecutionFlow(answer.execution_flow ?? []);
-    setCanvasFunctions(answer.functions ?? []);
-    setCanvasCalls([]); // chat hits span multiple files — no single-file call graph
     setFocusNonce((n) => n + 1);
   }, []);
 
@@ -152,15 +150,23 @@ export default function WorkspacePage() {
     setFocusNonce((n) => n + 1);
   }, []);
 
-  // Clicking a file node expands its functions on the canvas.
+  // Clicking a file node loads its AI summary for the detail panel. A monotonic
+  // request id guards against out-of-order responses when the user clicks
+  // between files quickly.
   const handleExpandFile = useCallback(
     (path: string) => {
-      fetchFileFunctions(activeRepo, path)
-        .then(({ functions, calls }) => {
-          setCanvasFunctions(functions);
-          setCanvasCalls(calls);
+      const req = ++summaryReqRef.current;
+      setFileSummary(null);
+      setSummaryLoading(true);
+      fetchFileSummary(activeRepo, path)
+        .then((text) => {
+          if (req !== summaryReqRef.current) return;
+          setFileSummary({ path, text });
+          setSummaryLoading(false);
         })
-        .catch(() => {});
+        .catch(() => {
+          if (req === summaryReqRef.current) setSummaryLoading(false);
+        });
     },
     [activeRepo],
   );
@@ -172,8 +178,6 @@ export default function WorkspacePage() {
     setPerspective("synaptic"); // the tour focuses individual files
     setTab("assistant"); // blueprint mode owns the canvas + blocks camera focus
     setBlueprint(null);
-    setCanvasFunctions([]); // clear chat function nodes so the canvas reads clean
-    setCanvasCalls([]);
     fetchPathway(activeRepo)
       .then((p) => {
         if (p.steps.length) {
@@ -331,11 +335,11 @@ export default function WorkspacePage() {
                 focusNonce={focusNonce}
                 onSelectNode={handleSelectNode}
                 blueprint={tab === "blueprint" ? blueprint : null}
-                functions={tab === "blueprint" ? [] : canvasFunctions}
-                callEdges={tab === "blueprint" ? [] : canvasCalls}
                 onExpandFile={handleExpandFile}
                 onClearHighlight={handleClearHighlight}
                 tourActive={tourBusy || tour !== null}
+                fileSummary={fileSummary}
+                summaryLoading={summaryLoading}
                 perspective={perspective}
               />
 

@@ -5,7 +5,7 @@ import { gsap } from "gsap";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-import { streamDiscover, type BlueprintResponse } from "../lib/api";
+import { streamDiscover, type BlueprintMode, type BlueprintResponse } from "../lib/api";
 
 interface BlueprintPanelProps {
   repo: string | null; // active repo root_path to scope discovery to
@@ -18,7 +18,22 @@ const categoryColor: Record<string, string> = {
   red: "#f87171",
 };
 
+// Models occasionally wrap the whole answer in a ```markdown fence — strip it so
+// ReactMarkdown renders the content instead of showing a raw code block.
+function stripFence(s: string): string {
+  return s
+    .replace(/^\s*```(?:markdown|md)?[ \t]*\n?/i, "")
+    .replace(/\n?```\s*$/i, "");
+}
+
+const MODES: { id: BlueprintMode; label: string; hint: string }[] = [
+  { id: "validate", label: "Validate", hint: "Should you build it? Impact, reuse leverage & effort." },
+  { id: "roadmap", label: "Roadmap", hint: "The build plan: what to reuse, extend & create — and where." },
+];
+
 export default function BlueprintPanel({ repo, onResult }: BlueprintPanelProps) {
+  const [mode, setMode] = useState<BlueprintMode>("roadmap");
+  const [resultMode, setResultMode] = useState<BlueprintMode>("roadmap");
   const [description, setDescription] = useState("");
   const [loading, setLoading] = useState(false);
   const [streaming, setStreaming] = useState(false);
@@ -44,15 +59,17 @@ export default function BlueprintPanel({ repo, onResult }: BlueprintPanelProps) 
     e.preventDefault();
     const desc = description.trim();
     if (!desc || loading) return;
+    const submittedMode = mode;
     setLoading(true);
     setStreaming(true);
     setError(null);
     setAnalysis("");
     let acc = "";
     try {
-      await streamDiscover(desc, repo, {
+      await streamDiscover(desc, repo, submittedMode, {
         onResult: (bp) => {
           setResult(bp);
+          setResultMode(submittedMode);
           onResult(bp);
         },
         onToken: (delta) => {
@@ -90,8 +107,29 @@ export default function BlueprintPanel({ repo, onResult }: BlueprintPanelProps) 
 
       <div className="flex-1 overflow-y-auto px-4 py-4">
         <form onSubmit={discover} className="space-y-2">
-          <label className="text-[11px] uppercase tracking-widest text-neutral-500">
-            Pitch a feature / PRD
+          {/* Validate / Roadmap mode toggle */}
+          <div className="flex rounded-lg border border-panel-border bg-neutral-900 p-0.5">
+            {MODES.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => setMode(m.id)}
+                disabled={loading}
+                className={
+                  "flex-1 rounded-md px-3 py-1.5 text-[12px] font-medium transition-colors disabled:opacity-50 " +
+                  (mode === m.id ? "bg-neon/15 text-neon" : "text-neutral-400 hover:text-neutral-200")
+                }
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+          <p className="px-0.5 text-[11px] leading-snug text-neutral-500">
+            {MODES.find((m) => m.id === mode)?.hint}
+          </p>
+
+          <label className="block pt-1 text-[11px] uppercase tracking-widest text-neutral-500">
+            Feature idea
           </label>
           <textarea
             value={description}
@@ -107,7 +145,13 @@ export default function BlueprintPanel({ repo, onResult }: BlueprintPanelProps) 
               disabled={!description.trim() || loading}
               className="flex-1 rounded-lg bg-neon px-3 py-2 text-[13px] font-medium text-neutral-950 transition-colors hover:brightness-110 disabled:opacity-40"
             >
-              {loading ? "Analyzing…" : "Discover reuse"}
+              {loading
+                ? mode === "validate"
+                  ? "Validating…"
+                  : "Charting…"
+                : mode === "validate"
+                  ? "Validate feature"
+                  : "Generate roadmap"}
             </button>
             {result && (
               <button
@@ -154,10 +198,10 @@ export default function BlueprintPanel({ repo, onResult }: BlueprintPanelProps) 
               <div className="rounded-lg border border-panel-border bg-neutral-900/60 px-3 py-2.5">
                 <div className="mb-1 flex items-center gap-1.5 text-[10px] uppercase tracking-widest text-neutral-500">
                   <span className="inline-block h-1.5 w-1.5 rounded-full bg-neon" />
-                  reuse briefing
+                  {resultMode === "validate" ? "validation" : "blueprint"}
                 </div>
                 <div className="md text-[12.5px] text-neutral-300">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{analysis}</ReactMarkdown>
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{stripFence(analysis)}</ReactMarkdown>
                   {streaming && (
                     <span className="ml-0.5 inline-block h-3.5 w-[2px] -translate-y-px animate-pulse bg-neon align-middle" />
                   )}
@@ -190,10 +234,11 @@ export default function BlueprintPanel({ repo, onResult }: BlueprintPanelProps) 
               </div>
             </div>
 
-            {/* Diff summary */}
+            {/* Diff summary — the file-level build plan (roadmap only) */}
+            {resultMode === "roadmap" && (
             <div ref={diffRef}>
               <div className="mb-1.5 text-[10px] uppercase tracking-widest text-neutral-500">
-                diff summary
+                files to change
               </div>
               <div className="space-y-1">
                 {result.diff_summary.length === 0 && (
@@ -221,6 +266,7 @@ export default function BlueprintPanel({ repo, onResult }: BlueprintPanelProps) 
                 ))}
               </div>
             </div>
+            )}
           </div>
         )}
       </div>

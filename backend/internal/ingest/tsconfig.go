@@ -8,12 +8,12 @@ import (
 	"project-synapse/backend/internal/parser"
 )
 
-// loadTSConfigAliases finds tsconfig.json / jsconfig.json files under root and
-// extracts their path-alias rules (e.g. `@/* -> ./*`), so TS/JS imports made
-// through those aliases resolve to real files during ingestion instead of
-// looking like external packages.
-func loadTSConfigAliases(absRoot string) []parser.AliasRule {
-	var rules []parser.AliasRule
+// loadTSConfigResolution finds tsconfig.json / jsconfig.json files under root and
+// extracts their import-resolution settings: path-alias rules (e.g. `@/* -> ./*`)
+// AND baseUrl roots (e.g. `src/common/x` under baseUrl "."). Both let TS/JS
+// imports resolve to real files during ingestion instead of looking external —
+// the baseUrl case is the NestJS `import { X } from 'src/...'` convention.
+func loadTSConfigResolution(absRoot string) (aliases []parser.AliasRule, baseDirs []string) {
 	_ = filepath.WalkDir(absRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -40,8 +40,12 @@ func loadTSConfigAliases(absRoot string) []parser.AliasRule {
 		if dir == "." {
 			dir = ""
 		}
-		rules = append(rules, parser.ParseTSConfigPaths(dir, content)...)
+		cfg := parser.ParseTSConfig(dir, content)
+		aliases = append(aliases, cfg.Aliases...)
+		if cfg.HasBaseDir {
+			baseDirs = append(baseDirs, cfg.BaseDir)
+		}
 		return nil
 	})
-	return rules
+	return aliases, baseDirs
 }

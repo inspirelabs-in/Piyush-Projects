@@ -132,11 +132,20 @@ func analyze(root string, files []store.FileRow, rels []store.RelRow, calls []st
 			unit = "this file's package (" + m + ")"
 		}
 		if len(importers) == 0 {
+			exportCount := len(g.exportsByFile[f])
+			reason := fmt.Sprintf("Exports %d symbol(s) but nothing in the repository imports %s, and it is not an entry point.", exportCount, unit)
+			evidence := []string{fmt.Sprintf("incoming imports: 0 · exports: %d", exportCount)}
+			if exportCount == 0 {
+				// No exports AND no importers = an inert file: a leftover stub, a
+				// fully commented-out module, or dead scratch code. Strongest signal.
+				reason = "No exports and no importers — an inert file (leftover stub, fully commented-out module, or dead scratch code)."
+				evidence = append(evidence, "0 exported symbols — nothing here can be referenced")
+			}
 			add(Candidate{
 				Kind: "file", Tier: "orphan_file", Path: f, Language: g.lang[f],
 				Confidence: "high",
-				Reason:     "Nothing in the repository imports " + unit + ", and it is not an entry point.",
-				Evidence:   []string{fmt.Sprintf("incoming imports: 0 · exports: %d", len(g.exportsByFile[f]))},
+				Reason:     reason,
+				Evidence:   evidence,
 				Uncertain:  uncertain,
 			})
 		} else {
@@ -408,15 +417,20 @@ func isEntry(file, lang string, hasEndpoint bool) bool {
 	case "rust":
 		return b == "main.rs" || b == "lib.rs" || b == "mod.rs"
 	}
-	// TS/JS — Next.js conventions + general entry/config files.
+	// TS/JS — Next.js conventions + Node/Nest bootstrap + general entry files.
 	switch name {
 	case "page", "layout", "route", "middleware", "proxy", "index",
 		"_app", "_document", "error", "loading", "not-found", "global-error",
-		"template", "default", "sitemap", "robots", "head", "manifest":
+		"template", "default", "sitemap", "robots", "head", "manifest",
+		"main", "server", "bootstrap": // Node/NestJS process entry points
 		return true
 	}
-	if strings.Contains(b, ".config.") || strings.HasPrefix(name, "opengraph-image") ||
-		strings.HasPrefix(name, "icon") || strings.HasPrefix(name, "apple-icon") {
+	// Config / tool-loaded files: consumed by a runtime or toolchain, never
+	// imported (e.g. *.config.js, .eslintrc.js, .prettierrc.js, jest.setup.ts).
+	if strings.Contains(b, ".config.") || strings.HasPrefix(b, ".") ||
+		strings.HasPrefix(name, "opengraph-image") || strings.HasPrefix(name, "icon") ||
+		strings.HasPrefix(name, "apple-icon") || strings.HasSuffix(name, ".setup") ||
+		strings.HasSuffix(name, ".d") { // *.d.ts ambient declarations
 		return true
 	}
 	return false

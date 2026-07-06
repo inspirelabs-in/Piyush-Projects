@@ -11,13 +11,14 @@ import (
 
 const verifySystem = `You are auditing a STATIC dead-code analysis for FALSE POSITIVES. Each candidate is a source file with NO static importers, flagged as possibly-dead. Static import analysis cannot see files reached indirectly, so your job is to spot those.
 
-Using the file path, language, and exported symbols, classify each file:
-- "framework": almost certainly invoked indirectly and NOT dead — e.g. a Next.js page/layout/route/middleware/loader/action, a registered HTTP route handler, a CLI/main/entry, a dependency-injected/registered provider, a public library API, generated code, a config- or convention-loaded module, or test setup.
-- "dead": genuinely appears removable — a plain module nothing references, with no framework or dynamic-entry signals.
-- "uncertain": you cannot tell from the given signals.
+You are given each file's path, language, exported symbols, imported packages, AND a short excerpt of its ACTUAL SOURCE. Read the source — it is the deciding evidence:
+- Framework decorators / registration in the source (@Controller, @Injectable, @Module, @Guard, @Pipe, @Entity, @Schema/@ObjectType, @Resolver, @Component, @Directive, route/handler/provider registration, DI) => "framework": invoked indirectly, NOT dead.
+- Imports of framework packages (@nestjs/*, next, express, react, @angular/*, typeorm, etc.) corroborate a framework role.
+- An EMPTY file, a FULLY COMMENTED-OUT module ("no extractable declarations"), or a plain declaration nothing references with no framework signals => "dead": genuinely removable.
+- You truly cannot tell => "uncertain".
 
 Respond with ONE JSON object, nothing else:
-{"verdicts":[{"id":<number>,"verdict":"framework|dead|uncertain","reason":"short justification"}]}
+{"verdicts":[{"id":<number>,"verdict":"framework|dead|uncertain","reason":"short justification grounded in the source"}]}
 Return one verdict per candidate id. Output valid JSON only — no prose, no code fences.`
 
 // verify reviews file-level candidates with the LLM and drops the ones that are
@@ -25,9 +26,16 @@ Return one verdict per candidate id. Output valid JSON only — no prose, no cod
 // ones, and confirms the rest — cutting the main dead-code false-positive class.
 func (e *Engine) verify(ctx context.Context, rep *Report, rels []store.RelRow) {
 	exportsByFile := map[string][]string{}
+	importsByFile := map[string][]string{}
 	for _, r := range rels {
-		if r.RelationshipType == "exports" {
+		switch r.RelationshipType {
+		case "exports":
 			exportsByFile[r.SourceSymbol] = append(exportsByFile[r.SourceSymbol], r.TargetSymbol)
+		case "imports":
+			// Prefer the package/module name so the LLM sees framework signals.
+			if ext, _ := r.Metadata["external"].(bool); ext {
+				importsByFile[r.SourceSymbol] = appendUnique(importsByFile[r.SourceSymbol], r.TargetSymbol)
+			}
 		}
 	}
 
@@ -40,19 +48,35 @@ func (e *Engine) verify(ctx context.Context, rep *Report, rels []store.RelRow) {
 	if len(targets) == 0 {
 		return
 	}
-	const maxVerify = 40
+	const maxVerify = 50
 	if len(targets) > maxVerify {
 		targets = targets[:maxVerify]
 	}
 
+	// Fetch a compact source excerpt for each candidate so the LLM judges the
+	// real code (decorators, framework wiring, emptiness), not just the name.
+	codeByFile := make(map[string]string, len(targets))
+	for _, idx := range targets {
+		p := rep.Candidates[idx].Path
+		if _, done := codeByFile[p]; done {
+			continue
+		}
+		rows, err := e.Store.FileFunctions(ctx, rep.Repo, p)
+		if err != nil {
+			codeByFile[p] = ""
+			continue
+		}
+		codeByFile[p] = fileExcerpt(rows)
+	}
+
 	drop := map[int]bool{}
-	const batch = 10
+	const batch = 8
 	for i := 0; i < len(targets); i += batch {
 		end := i + batch
 		if end > len(targets) {
 			end = len(targets)
 		}
-		e.verifyBatch(ctx, rep, targets[i:end], exportsByFile, drop)
+		e.verifyBatch(ctx, rep, targets[i:end], exportsByFile, importsByFile, codeByFile, drop)
 	}
 
 	if len(drop) == 0 {
@@ -72,7 +96,7 @@ func (e *Engine) verify(ctx context.Context, rep *Report, rels []store.RelRow) {
 	rep.Notes = append(rep.Notes, fmt.Sprintf("LLM verification removed %d likely framework-invoked / dynamically-loaded false positive(s).", len(drop)))
 }
 
-func (e *Engine) verifyBatch(ctx context.Context, rep *Report, idxs []int, exportsByFile map[string][]string, drop map[int]bool) {
+func (e *Engine) verifyBatch(ctx context.Context, rep *Report, idxs []int, exportsByFile, importsByFile map[string][]string, codeByFile map[string]string, drop map[int]bool) {
 	var payload strings.Builder
 	for i, idx := range idxs {
 		c := rep.Candidates[idx]
@@ -80,8 +104,28 @@ func (e *Engine) verifyBatch(ctx context.Context, rep *Report, idxs []int, expor
 		if len(exps) > 12 {
 			exps = exps[:12]
 		}
-		fmt.Fprintf(&payload, "\n[%d] file: %s\n    language: %s\n    exported symbols: %s\n    flagged because: %s\n",
-			i, c.Path, c.Language, strings.Join(exps, ", "), c.Reason)
+		imps := importsByFile[c.Path]
+		if len(imps) > 12 {
+			imps = imps[:12]
+		}
+		expStr := strings.Join(exps, ", ")
+		if expStr == "" {
+			expStr = "(none)"
+		}
+		impStr := strings.Join(imps, ", ")
+		if impStr == "" {
+			impStr = "(none)"
+		}
+		excerpt := strings.TrimSpace(codeByFile[c.Path])
+		if excerpt == "" {
+			if len(exps) == 0 {
+				excerpt = "(no declarations and no exports — an empty or fully commented-out file)"
+			} else {
+				excerpt = "(source excerpt unavailable)"
+			}
+		}
+		fmt.Fprintf(&payload, "\n[%d] file: %s\n    language: %s\n    exported symbols: %s\n    imports packages: %s\n    flagged because: %s\n    source excerpt:\n%s\n",
+			i, c.Path, c.Language, expStr, impStr, c.Reason, indentLines(excerpt, "      "))
 	}
 	raw, err := e.Chat.Complete(ctx, verifySystem, payload.String())
 	if err != nil {
@@ -119,6 +163,52 @@ func (e *Engine) verifyBatch(ctx context.Context, rep *Report, idxs []int, expor
 			}
 		}
 	}
+}
+
+// fileExcerpt renders a compact, size-capped view of a file's real declarations
+// (each symbol's signature + a few body lines) so the verifier can see framework
+// decorators, wiring, or the lack of any code. Empty rows => "" (the caller turns
+// that into an "empty / commented-out" note, distinguishing it from a file whose
+// source simply wasn't chunked).
+func fileExcerpt(rows []store.FunctionRow) string {
+	const (
+		perSymbol = 320
+		maxTotal  = 1400
+	)
+	var b strings.Builder
+	for _, r := range rows {
+		code := strings.TrimSpace(r.Code)
+		if code == "" {
+			continue
+		}
+		lines := strings.Split(code, "\n")
+		if len(lines) > 6 {
+			lines = lines[:6] // the declaration head (decorators + signature), not the whole body
+		}
+		snippet := strings.TrimRight(strings.Join(lines, "\n"), "\n")
+		if len(snippet) > perSymbol {
+			snippet = snippet[:perSymbol] + "…"
+		}
+		b.WriteString(snippet)
+		b.WriteString("\n---\n")
+		if b.Len() >= maxTotal {
+			break
+		}
+	}
+	out := strings.TrimRight(b.String(), "-\n ")
+	if len(out) > maxTotal {
+		out = out[:maxTotal] + "…"
+	}
+	return out
+}
+
+// indentLines prefixes every line of s with pad (for readable prompt payloads).
+func indentLines(s, pad string) string {
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = pad + lines[i]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func extractJSON(raw string) string {

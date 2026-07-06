@@ -46,19 +46,27 @@ func BuildKnownSet(relPaths []string) map[string]bool {
 // known file set plus a directory→files map (needed for Go package imports and
 // Rust module resolution, which point at directories/modules, not single files).
 type ResolveIndex struct {
-	Files   map[string]bool     // relpath -> true
-	dirs    map[string][]string // dir relpath ("" = root) -> sorted files in it
-	aliases []AliasRule         // tsconfig path aliases (e.g. @/* -> ./*)
+	Files    map[string]bool     // relpath -> true
+	dirs     map[string][]string // dir relpath ("" = root) -> sorted files in it
+	aliases  []AliasRule         // tsconfig path aliases (e.g. @/* -> ./*)
+	baseDirs []string            // tsconfig baseUrl roots (e.g. "" for baseUrl ".")
 }
 
 // BuildIndex builds a ResolveIndex from the ingest batch's relative paths.
 func BuildIndex(relPaths []string) *ResolveIndex {
-	return BuildIndexWithAliases(relPaths, nil)
+	return BuildIndexWithConfig(relPaths, nil, nil)
 }
 
 // BuildIndexWithAliases builds a ResolveIndex with tsconfig path aliases, so
 // imports like `@/lib/x` resolve to real files instead of looking external.
 func BuildIndexWithAliases(relPaths []string, aliases []AliasRule) *ResolveIndex {
+	return BuildIndexWithConfig(relPaths, aliases, nil)
+}
+
+// BuildIndexWithConfig builds a ResolveIndex with tsconfig path aliases AND
+// baseUrl roots, so both `@/lib/x` (alias) and `src/common/x` (baseUrl-relative,
+// the NestJS convention) resolve to real files instead of looking external.
+func BuildIndexWithConfig(relPaths []string, aliases []AliasRule, baseDirs []string) *ResolveIndex {
 	files := BuildKnownSet(relPaths)
 	dirs := map[string][]string{}
 	for p := range files {
@@ -71,7 +79,7 @@ func BuildIndexWithAliases(relPaths []string, aliases []AliasRule) *ResolveIndex
 	for k := range dirs {
 		sort.Strings(dirs[k])
 	}
-	return &ResolveIndex{Files: files, dirs: dirs, aliases: aliases}
+	return &ResolveIndex{Files: files, dirs: dirs, aliases: aliases, baseDirs: dedupeStrings(baseDirs)}
 }
 
 // ResolveImports fills the Resolved / External / ResolvedOK fields on every
@@ -86,19 +94,43 @@ func ResolveImports(fa *FileAnalysis, ix *ResolveIndex) {
 	default:
 		dir := path.Dir(fa.RelPath)
 		for i := range fa.Imports {
-			// tsconfig path aliases first (e.g. `@/lib/x`), then relative resolution.
-			if resolved, ok := ix.resolveAlias(fa.Imports[i].Specifier); ok {
+			spec := fa.Imports[i].Specifier
+			// tsconfig path aliases first (e.g. `@/lib/x`), then baseUrl-relative
+			// bare imports (e.g. `src/common/x`), then relative resolution.
+			if resolved, ok := ix.resolveAlias(spec); ok {
 				fa.Imports[i].Resolved = resolved
 				fa.Imports[i].External = false
 				fa.Imports[i].ResolvedOK = true
 				continue
 			}
-			resolved, external, ok := resolveSpecifier(dir, fa.Imports[i].Specifier, ix.Files)
+			if resolved, ok := ix.resolveBaseURL(spec); ok {
+				fa.Imports[i].Resolved = resolved
+				fa.Imports[i].External = false
+				fa.Imports[i].ResolvedOK = true
+				continue
+			}
+			resolved, external, ok := resolveSpecifier(dir, spec, ix.Files)
 			fa.Imports[i].Resolved = resolved
 			fa.Imports[i].External = external
 			fa.Imports[i].ResolvedOK = ok
 		}
 	}
+}
+
+// resolveBaseURL resolves a non-relative ("bare") specifier against the tsconfig
+// baseUrl root(s) — e.g. a NestJS `import { X } from 'src/common/x'` under
+// baseUrl ".". npm packages (react, @nestjs/common, mongoose) simply won't match
+// a repo file and fall through to the external classification.
+func (ix *ResolveIndex) resolveBaseURL(specifier string) (string, bool) {
+	if specifier == "" || specifier[0] == '.' || specifier[0] == '/' {
+		return "", false // relative imports resolve the usual way
+	}
+	for _, base := range ix.baseDirs {
+		if r, ok := ix.resolveRelPath(joinRel(base, specifier)); ok {
+			return r, true
+		}
+	}
+	return "", false
 }
 
 // resolveAlias rewrites a tsconfig-aliased specifier (e.g. `@/lib/x`) to a real
@@ -184,10 +216,17 @@ func (ix *ResolveIndex) resolveRelPath(rel string) (string, bool) {
 
 var jsoncTrailingComma = regexp.MustCompile(`,(\s*[}\]])`)
 
-// ParseTSConfigPaths extracts path-alias rules from a tsconfig/jsconfig file.
-// tsconfigDir is the file's directory relative to the repo root (""=root).
-// Tolerates JSONC (comments + trailing commas).
-func ParseTSConfigPaths(tsconfigDir string, content []byte) []AliasRule {
+// TSConfig holds the import-resolution settings extracted from a tsconfig.
+type TSConfig struct {
+	Aliases    []AliasRule // path-alias rules (e.g. @/* -> ./*)
+	BaseDir    string      // baseUrl directory relative to the repo root ("" = root)
+	HasBaseDir bool        // whether the tsconfig sets a baseUrl at all
+}
+
+// ParseTSConfig extracts both the path-alias rules AND the baseUrl root from a
+// tsconfig/jsconfig file. tsconfigDir is the file's directory relative to the
+// repo root (""=root). Tolerates JSONC (comments + trailing commas).
+func ParseTSConfig(tsconfigDir string, content []byte) TSConfig {
 	content = bytes.TrimPrefix(content, []byte{0xEF, 0xBB, 0xBF}) // strip a UTF-8 BOM
 
 	var cfg struct {
@@ -200,30 +239,38 @@ func ParseTSConfigPaths(tsconfigDir string, content []byte) []AliasRule {
 	// glob patterns like "**/*.ts" (which contain /* and */) are never mangled.
 	if json.Unmarshal(content, &cfg) != nil {
 		if json.Unmarshal(stripJSONC(content), &cfg) != nil {
-			return nil
+			return TSConfig{}
 		}
 	}
-	if len(cfg.CompilerOptions.Paths) == 0 {
-		return nil
-	}
+
+	var out TSConfig
 	base := tsconfigDir
-	if b := strings.TrimSpace(cfg.CompilerOptions.BaseURL); b != "" && b != "." {
+	if b := strings.TrimSpace(cfg.CompilerOptions.BaseURL); b != "" {
 		base = joinRel(tsconfigDir, b)
+		if base == "." {
+			base = ""
+		}
+		out.BaseDir = base
+		out.HasBaseDir = true
 	}
-	var rules []AliasRule
 	for pattern, targets := range cfg.CompilerOptions.Paths {
 		i := strings.IndexByte(pattern, '*')
 		if i < 0 {
 			continue // exact (non-wildcard) aliases are rare; skip for now
 		}
-		rules = append(rules, AliasRule{
+		out.Aliases = append(out.Aliases, AliasRule{
 			BaseDir: base,
 			Prefix:  pattern[:i],
 			Suffix:  pattern[i+1:],
 			Targets: targets,
 		})
 	}
-	return rules
+	return out
+}
+
+// ParseTSConfigPaths extracts just the path-alias rules from a tsconfig/jsconfig.
+func ParseTSConfigPaths(tsconfigDir string, content []byte) []AliasRule {
+	return ParseTSConfig(tsconfigDir, content).Aliases
 }
 
 // resolveGoImports maps Go package paths to internal directories. A Go import is
@@ -362,6 +409,22 @@ func rustCrateName(spec string) string {
 		return spec[:i]
 	}
 	return spec
+}
+
+// dedupeStrings returns the unique values of xs, preserving first-seen order.
+func dedupeStrings(xs []string) []string {
+	if len(xs) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(xs))
+	out := make([]string, 0, len(xs))
+	for _, x := range xs {
+		if !seen[x] {
+			seen[x] = true
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // joinRel joins relative path parts with forward slashes, treating "" as root.

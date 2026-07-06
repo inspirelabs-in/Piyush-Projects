@@ -116,7 +116,7 @@ func (s *Server) handleDiscoverStream(w http.ResponseWriter, r *http.Request) {
 	}
 	sse.send("result", resp)
 
-	if err := s.blueprint.StreamNarrative(r.Context(), resp, func(delta string) {
+	if err := s.blueprint.StreamNarrative(r.Context(), resp, req.Mode, req.Repo, func(delta string) {
 		sse.send("token", map[string]string{"delta": delta})
 	}); err != nil {
 		log.Printf("blueprint narrate error: %v", err)

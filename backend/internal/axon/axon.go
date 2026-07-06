@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"project-synapse/backend/internal/llm"
 	"project-synapse/backend/internal/store"
@@ -43,8 +45,9 @@ type Pathway struct {
 
 // Engine builds pathways from the store, optionally narrated by an LLM.
 type Engine struct {
-	Store *store.Store
-	Chat  llm.ChatClient // nil => deterministic summaries
+	Store    *store.Store
+	Chat     llm.ChatClient // nil => deterministic summaries
+	sumCache sync.Map       // (root\x00path) -> string, memoized per-file summaries
 }
 
 // Pathway builds the curated reading tour for a repo.
@@ -151,6 +154,123 @@ func (e *Engine) Pathway(ctx context.Context, root string) (*Pathway, error) {
 	pw := &Pathway{Repo: root, Name: repoName(root), Steps: steps}
 	e.narrate(ctx, pw)
 	return pw, nil
+}
+
+// FileSummary returns a concise 2-3 sentence explanation of a single file's
+// responsibility, grounded in its real signatures — for the canvas detail panel
+// on node-click. Results are memoized per (root, path) for the process lifetime;
+// it falls back to a deterministic line when no LLM is configured or the call
+// fails.
+func (e *Engine) FileSummary(ctx context.Context, root, path string) (string, error) {
+	key := root + "\x00" + path
+	if v, ok := e.sumCache.Load(key); ok {
+		return v.(string), nil
+	}
+	rows, err := e.Store.FileFunctions(ctx, root, path)
+	if err != nil {
+		return "", err
+	}
+	summary := deterministicFileSummary(path, rows)
+	if e.Chat != nil {
+		if s := e.llmFileSummary(ctx, path, rows); s != "" {
+			summary = s
+		}
+	}
+	e.sumCache.Store(key, summary)
+	return summary, nil
+}
+
+const fileSummarySystem = `You explain a single source file to a new teammate. You are given the file path and a few real signatures pulled from it.
+
+Respond with ONE JSON object and nothing else:
+{"summary": "2-3 plain-English sentences describing what this file actually implements: its responsibility and its single most important function or type, named specifically, plus what kind of code depends on it. Flowing prose — no markdown, no lists."}
+
+Be concrete and name the real symbols. Avoid filler like "a core module", "handles the logic", or "an important file". If the signatures are sparse, infer from the path and names. Never invent behaviour that is not visible in the input. Output valid JSON only — no prose outside the object, no code fences.`
+
+func (e *Engine) llmFileSummary(ctx context.Context, path string, rows []store.FunctionRow) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "File: %s\n", path)
+	if syms := symbolNames(rows); len(syms) > 0 {
+		fmt.Fprintf(&b, "Symbols: %s\n", strings.Join(syms, ", "))
+	}
+	if ex := codeExcerpt(rows); ex != "" {
+		fmt.Fprintf(&b, "Signatures:\n%s", ex)
+	}
+	raw, err := e.Chat.Complete(ctx, fileSummarySystem, b.String())
+	if err != nil {
+		return ""
+	}
+	// Preferred path: the model returns {"summary": "..."}.
+	var parsed struct {
+		Summary string `json:"summary"`
+	}
+	if json.Unmarshal([]byte(extractJSON(raw)), &parsed) == nil {
+		if s := strings.TrimSpace(llm.CleanMarkdown(parsed.Summary)); s != "" {
+			return s
+		}
+	}
+	// Fallback: plain prose, or a differently-shaped object to flatten.
+	return cleanFileSummary(raw)
+}
+
+var summaryJSONValRe = regexp.MustCompile(`:\s*"((?:[^"\\]|\\.)*)"`)
+
+// cleanFileSummary normalizes the model output to plain prose. Some models
+// ignore the "no JSON" instruction and wrap the answer in an object; when that
+// happens we flatten its string values back into a sentence, and discard it
+// entirely (so the caller falls back to the deterministic line) if nothing
+// salvageable remains.
+func cleanFileSummary(raw string) string {
+	s := strings.TrimSpace(llm.CleanMarkdown(strings.TrimSpace(raw)))
+	if strings.HasPrefix(s, "{") {
+		var parts []string
+		for _, m := range summaryJSONValRe.FindAllStringSubmatch(s, -1) {
+			var v string
+			if json.Unmarshal([]byte(`"`+m[1]+`"`), &v) != nil {
+				v = m[1]
+			}
+			if v = strings.TrimSpace(v); v != "" {
+				parts = append(parts, v)
+			}
+		}
+		flat := strings.Join(parts, " ")
+		if len(flat) < 24 {
+			return ""
+		}
+		return flat
+	}
+	return s
+}
+
+func deterministicFileSummary(path string, rows []store.FunctionRow) string {
+	base := filepath.Base(path)
+	syms := symbolNames(rows)
+	if len(syms) == 0 {
+		return fmt.Sprintf("%s exposes no functions or classes — likely configuration, type declarations, or a re-export/barrel file.", base)
+	}
+	if len(syms) > 5 {
+		syms = syms[:5]
+	}
+	return fmt.Sprintf("%s defines %s.", base, strings.Join(syms, ", "))
+}
+
+// symbolNames returns the unique top-level symbol names of a file's chunks,
+// collapsing "foo#part2" chunk-split markers.
+func symbolNames(rows []store.FunctionRow) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, r := range rows {
+		base := r.Symbol
+		if i := strings.IndexByte(base, '#'); i >= 0 {
+			base = base[:i]
+		}
+		if base == "" || seen[base] {
+			continue
+		}
+		seen[base] = true
+		out = append(out, base)
+	}
+	return out
 }
 
 func roleFor(isDoc bool, deps, importedBy map[string]bool, hasEndpoint bool) string {

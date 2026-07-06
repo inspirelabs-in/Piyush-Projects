@@ -41,6 +41,7 @@ func NewHTTPServer(addr string, st *store.Store, orch *rag.Orchestrator, bp *blu
 	mux.HandleFunc("DELETE /api/repos", s.handleDeleteRepo)
 	mux.HandleFunc("GET /api/graph/data", s.handleGraphData)
 	mux.HandleFunc("GET /api/file/functions", s.handleFileFunctions)
+	mux.HandleFunc("GET /api/file/summary", s.handleFileSummary)
 	mux.HandleFunc("GET /api/docs", s.handleDocs)
 	mux.HandleFunc("GET /api/architecture", s.handleArchitecture)
 	mux.HandleFunc("GET /api/prune", s.handlePrune)
@@ -212,6 +213,28 @@ func (s *Server) handleFileFunctions(w http.ResponseWriter, r *http.Request) {
 		calls = nil // non-fatal — still return the functions
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"functions": fns, "calls": calls})
+}
+
+// handleFileSummary returns a short LLM-written explanation of one file's role,
+// for the canvas detail panel. Params: ?repo=<root>&path=<file_path>.
+func (s *Server) handleFileSummary(w http.ResponseWriter, r *http.Request) {
+	repo := r.URL.Query().Get("repo")
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "path query parameter is required"})
+		return
+	}
+	if s.axon == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"summary": ""})
+		return
+	}
+	summary, err := s.axon.FileSummary(r.Context(), repo, path)
+	if err != nil {
+		log.Printf("file summary error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to summarize"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"summary": summary})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

@@ -168,16 +168,19 @@ export interface StreamDiscoverHandlers {
 }
 
 /** Stream capability discovery: the structured result, then a narrative briefing. */
+export type BlueprintMode = "validate" | "roadmap";
+
 export async function streamDiscover(
   description: string,
   repo: string | null,
+  mode: BlueprintMode,
   handlers: StreamDiscoverHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/api/blueprint/discover/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
-    body: JSON.stringify({ description, repo: repo ?? "" }),
+    body: JSON.stringify({ description, repo: repo ?? "", mode }),
     signal,
   });
   if (!res.ok || !res.body) {
@@ -244,6 +247,23 @@ export async function fetchFileFunctions(
   // on so downstream filtering (canvas file-detail) and node ids stay consistent.
   const functions: FunctionHit[] = (data.functions ?? []).map((f) => ({ ...f, file: path }));
   return { functions, calls: data.calls ?? [] };
+}
+
+// Short LLM-written summary of a single file's role (canvas detail panel).
+export async function fetchFileSummary(
+  repo: string | null,
+  path: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const params = new URLSearchParams({ path });
+  if (repo) params.set("repo", repo);
+  const res = await fetch(`${API_BASE}/api/file/summary?${params.toString()}`, {
+    signal,
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) throw new Error(`file summary fetch failed: ${res.status}`);
+  const data = (await res.json()) as { summary?: string };
+  return data.summary ?? "";
 }
 
 // --- Axon Pathway (dependency-ordered onboarding tour) ----------------------

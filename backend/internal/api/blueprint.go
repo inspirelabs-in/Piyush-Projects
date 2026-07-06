@@ -9,7 +9,8 @@ import (
 
 type discoverRequest struct {
 	Description string `json:"description"`
-	Repo        string `json:"repo"` // root_path to scope discovery to ("" = all repos)
+	Repo        string `json:"repo"`           // root_path to scope discovery to ("" = all repos)
+	Mode        string `json:"mode,omitempty"` // "validate" | "roadmap" (default roadmap)
 }
 
 // handleDiscover runs the AI capability-discovery pipeline: it decomposes a

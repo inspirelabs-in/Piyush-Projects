@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -11,6 +12,21 @@ import (
 	"project-synapse/backend/internal/llm"
 	"project-synapse/backend/internal/store"
 )
+
+// Blueprint modes: Validate answers "should we build this, and how does it
+// impact the product?"; Roadmap answers "what do we build, reuse, and where?".
+const (
+	ModeRoadmap  = "roadmap"
+	ModeValidate = "validate"
+)
+
+// normalizeMode defaults anything unrecognised to roadmap.
+func normalizeMode(m string) string {
+	if strings.EqualFold(strings.TrimSpace(m), ModeValidate) {
+		return ModeValidate
+	}
+	return ModeRoadmap
+}
 
 // Engine runs feature discovery: extract intents, score each against the
 // codebase concurrently, and assemble the blueprint.
@@ -62,30 +78,112 @@ func (e *Engine) Discover(ctx context.Context, description, root string) (*Respo
 	return assemble(description, intents, matches), nil
 }
 
-const narrateSystem = `You are a staff software architect briefing an engineer on a code-reuse analysis for a proposed feature.
-Given the structured analysis (what already exists to REUSE, what to EXTEND, and what to BUILD new), write a short, decisive briefing of 3-5 sentences in GitHub-flavored markdown.
-Be concrete: name the specific entities/actions and the files involved, lead with the highest-leverage reuse, and end with the net build effort. Output the markdown briefing only — no JSON, no headings.`
+const roadmapSystem = `You are a staff engineer writing an implementation blueprint for a proposed feature in THIS codebase. You are given a code-reuse analysis (what already EXISTS to reuse, what to EXTEND, and the GAPS to build) with the real files involved, plus a sample of the repository's directory layout.
 
-// StreamNarrative streams a natural-language reuse briefing for an assembled
-// blueprint via onToken. It uses the LLM when configured (token-by-token when
-// the provider supports streaming) and falls back to a deterministic summary.
-func (e *Engine) StreamNarrative(ctx context.Context, resp *Response, onToken func(string)) error {
+Write an actionable blueprint in GitHub-flavored markdown using these sections (skip a section only if it is truly empty):
+### Reuse
+Existing files/symbols to build on — name the real paths.
+### Extend
+Which existing files to modify, and what to add to each.
+### Build new
+The new files/folders to create and WHERE they belong — mirror the repository's existing folder conventions from the layout sample.
+### Steps
+A short ordered build plan (3-6 concrete steps).
+
+Be concrete and reference real file paths. Keep it tight and skimmable. Output only the markdown — no preamble, no closing remarks, and do NOT wrap your whole answer in a code fence.`
+
+const validateSystem = `You are a senior product engineer advising whether a proposed feature is worth building for THIS codebase, grounded in a code-reuse analysis (how much already exists to reuse vs. must be built new).
+
+Write a decisive validation in GitHub-flavored markdown using these sections:
+### Verdict
+One line — **Build**, **Build later**, or **Reconsider** — plus a one-sentence why.
+### Why it fits
+How much leverages existing code (name the reusable pieces); high reuse means lower cost & risk. Say plainly if it is mostly net-new.
+### Product impact
+What this enables for users and the product, and who benefits.
+### Effort & risks
+Rough build effort (from the extend/build counts) and the main risks or dependencies to watch.
+
+Be concrete and honest — recommend against low-value or disproportionately costly features. Keep it around 150-200 words. Output only the markdown, and do NOT wrap your whole answer in a code fence.`
+
+// StreamNarrative streams a natural-language briefing for an assembled blueprint
+// via onToken, framed by mode: "roadmap" (implementation plan) or "validate"
+// (build/impact recommendation). Uses the LLM when configured (token-by-token
+// when supported) and falls back to a deterministic summary.
+func (e *Engine) StreamNarrative(ctx context.Context, resp *Response, mode, root string, onToken func(string)) error {
+	mode = normalizeMode(mode)
 	chat := e.chat()
 	if chat == nil {
-		onToken(deterministicNarrative(resp))
+		onToken(deterministicNarrative(resp, mode))
 		return nil
 	}
-	prompt := buildNarratePrompt(resp)
+	system := roadmapSystem
+	layout := ""
+	if mode == ModeValidate {
+		system = validateSystem
+	} else {
+		layout = e.repoLayout(ctx, root)
+	}
+	prompt := buildModePrompt(resp, mode, layout)
 	if sc, ok := chat.(llm.StreamingChatClient); ok {
-		_, err := sc.Stream(ctx, narrateSystem, prompt, onToken)
+		_, err := sc.Stream(ctx, system, prompt, onToken)
 		return err
 	}
-	raw, err := chat.Complete(ctx, narrateSystem, prompt)
+	raw, err := chat.Complete(ctx, system, prompt)
 	if err != nil {
 		return err
 	}
 	onToken(raw)
 	return nil
+}
+
+// repoLayout returns a compact sample of the repo's most-populated directories,
+// so a roadmap targets real folders and follows existing conventions.
+func (e *Engine) repoLayout(ctx context.Context, root string) string {
+	if e.Store == nil || strings.TrimSpace(root) == "" {
+		return ""
+	}
+	files, err := e.Store.FilesByRoot(ctx, root)
+	if err != nil || len(files) == 0 {
+		return ""
+	}
+	count := map[string]int{}
+	for _, f := range files {
+		if d := twoLevelDir(f.FilePath); d != "" {
+			count[d]++
+		}
+	}
+	dirs := make([]string, 0, len(count))
+	for d := range count {
+		dirs = append(dirs, d)
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		if count[dirs[i]] != count[dirs[j]] {
+			return count[dirs[i]] > count[dirs[j]]
+		}
+		return dirs[i] < dirs[j]
+	})
+	if len(dirs) > 14 {
+		dirs = dirs[:14]
+	}
+	var b strings.Builder
+	for _, d := range dirs {
+		fmt.Fprintf(&b, "  %s/ (%d files)\n", d, count[d])
+	}
+	return b.String()
+}
+
+// twoLevelDir returns the first two path segments of a file's directory.
+func twoLevelDir(p string) string {
+	parts := strings.Split(strings.ReplaceAll(p, "\\", "/"), "/")
+	if len(parts) <= 1 {
+		return ""
+	}
+	parts = parts[:len(parts)-1] // drop the filename
+	if len(parts) > 2 {
+		parts = parts[:2]
+	}
+	return strings.Join(parts, "/")
 }
 
 func (e *Engine) chat() llm.ChatClient {
@@ -95,9 +193,9 @@ func (e *Engine) chat() llm.ChatClient {
 	return e.Extractor.Chat
 }
 
-func buildNarratePrompt(resp *Response) string {
+func buildModePrompt(resp *Response, mode, layout string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Feature description: %s\n\n", resp.Description)
+	fmt.Fprintf(&b, "Feature: %s\n\n", resp.Description)
 	fmt.Fprintf(&b, "Reuse score: %.0f%% (%d reuse / %d extend / %d build of %d intents)\n\n",
 		resp.Summary.ReuseScore*100, resp.Summary.Green, resp.Summary.Yellow, resp.Summary.Red, resp.Summary.Total)
 
@@ -124,31 +222,49 @@ func buildNarratePrompt(resp *Response) string {
 	if len(resp.Gaps) > 0 {
 		var g []string
 		for _, gap := range resp.Gaps {
-			g = append(g, fmt.Sprintf("  - %s → new file %s", gap.Label, gap.SuggestedFile))
+			g = append(g, fmt.Sprintf("  - %s (%s)", gap.Label, gap.Kind))
 		}
-		fmt.Fprintf(&b, "\nSuggested new files:\n%s\n", strings.Join(g, "\n"))
+		fmt.Fprintf(&b, "\nGaps to build:\n%s\n", strings.Join(g, "\n"))
+	}
+	if mode == ModeRoadmap && strings.TrimSpace(layout) != "" {
+		fmt.Fprintf(&b, "\nRepository layout (most-populated directories — follow these conventions when placing new files):\n%s", layout)
 	}
 	return b.String()
 }
 
 // deterministicNarrative is the offline briefing used when no LLM is configured.
-func deterministicNarrative(resp *Response) string {
+func deterministicNarrative(resp *Response, mode string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "**Reuse analysis** — overall reuse score **%.0f%%** across %d intents.\n\n",
-		resp.Summary.ReuseScore*100, resp.Summary.Total)
-	if resp.Summary.Green > 0 {
-		fmt.Fprintf(&b, "- **Reuse (%d):** existing structures already cover these capabilities.\n", resp.Summary.Green)
+	g, y, r := resp.Summary.Green, resp.Summary.Yellow, resp.Summary.Red
+	if g == 0 && y == 0 && r == 0 {
+		return "No intents were extracted from the description. Try describing the feature in more detail."
 	}
-	if resp.Summary.Yellow > 0 {
-		fmt.Fprintf(&b, "- **Extend (%d):** partial coverage exists — extend the highlighted files.\n", resp.Summary.Yellow)
+
+	if mode == ModeValidate {
+		verdict := "Build later"
+		switch {
+		case resp.Summary.ReuseScore >= 0.6:
+			verdict = "Build"
+		case r > g+y:
+			verdict = "Reconsider"
+		}
+		fmt.Fprintf(&b, "### Verdict\n**%s** — %.0f%% of this feature is already covered by existing code.\n\n", verdict, resp.Summary.ReuseScore*100)
+		fmt.Fprintf(&b, "### Why\n- **Reuse (%d)** / **Extend (%d)** / **Build new (%d)** across %d intents.\n", g, y, r, resp.Summary.Total)
+		b.WriteString("\n_(Offline summary — configure an LLM key for a full validation.)_")
+		return b.String()
 	}
-	if resp.Summary.Red > 0 {
-		fmt.Fprintf(&b, "- **Build (%d):** no existing structure — create the suggested new files.\n", resp.Summary.Red)
+
+	fmt.Fprintf(&b, "### Blueprint — %.0f%% reuse across %d intents\n\n", resp.Summary.ReuseScore*100, resp.Summary.Total)
+	if g > 0 {
+		fmt.Fprintf(&b, "- **Reuse (%d):** existing structures already cover these capabilities.\n", g)
 	}
-	if resp.Summary.Green == 0 && resp.Summary.Yellow == 0 && resp.Summary.Red == 0 {
-		b.WriteString("No intents were extracted from the description.")
+	if y > 0 {
+		fmt.Fprintf(&b, "- **Extend (%d):** partial coverage exists — extend the highlighted files.\n", y)
 	}
-	b.WriteString("\n_(Offline summary — configure an LLM key for a full natural-language briefing.)_")
+	if r > 0 {
+		fmt.Fprintf(&b, "- **Build new (%d):** no existing structure — create new files.\n", r)
+	}
+	b.WriteString("\n_(Offline summary — configure an LLM key for a full blueprint.)_")
 	return b.String()
 }
 

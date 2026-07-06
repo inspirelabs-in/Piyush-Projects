@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as d3 from "d3";
 
-import type { BlueprintResponse, CallEdge, FunctionHit, GraphData } from "../lib/api";
+import type { BlueprintResponse, GraphData } from "../lib/api";
 
 type Layout = "galaxy" | "radial";
 
@@ -13,11 +13,11 @@ interface GraphViewProps {
   focusNonce: number;
   onSelectNode: (id: string | null, label: string | null) => void;
   blueprint?: BlueprintResponse | null;
-  functions?: FunctionHit[];
-  callEdges?: CallEdge[];
   onExpandFile?: (path: string) => void;
   onClearHighlight?: () => void;
   tourActive?: boolean;
+  fileSummary?: { path: string; text: string } | null;
+  summaryLoading?: boolean;
   perspective?: "synaptic" | "executive";
 }
 
@@ -28,6 +28,7 @@ const MAX_HIGHLIGHT = 6;
 interface GNode extends d3.SimulationNodeDatum {
   id: string; label: string; kind: string; path?: string;
   folder: string; degree: number; r: number; color: string;
+  alpha?: number; // animated opacity, eased toward its lit/dim target each frame
 }
 interface GLink extends d3.SimulationLinkDatum<GNode> { source: string | GNode; target: string | GNode; }
 type Selected = { id: string; label: string; path?: string; kind: string };
@@ -49,7 +50,8 @@ const OUT_COLOR = "#fbbf24"; // imports (outgoing)
 const IN_COLOR = "#38bdf8"; // imported-by (incoming)
 
 export default function GraphView({
-  graph, highlightedFiles, focusNonce, onSelectNode, functions = [], onExpandFile, onClearHighlight, tourActive = false, perspective = "synaptic",
+  graph, highlightedFiles, focusNonce, onSelectNode, onExpandFile, onClearHighlight, tourActive = false,
+  fileSummary, summaryLoading = false, perspective = "synaptic",
 }: GraphViewProps) {
   const [layout, setLayout] = useState<Layout>("galaxy");
   const [search, setSearch] = useState("");
@@ -140,6 +142,7 @@ export default function GraphView({
     let width = wrap.clientWidth, height = wrap.clientHeight;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     let transform = d3.zoomIdentity;
+    let alphaHot = false; // true while any node opacity is still easing to target
 
     type RadialLink = { pts: [number, number][]; a: string; b: string };
     let radialLinks: RadialLink[] = [];
@@ -226,13 +229,19 @@ export default function GraphView({
       // for a separate screen-space pass (constant size + de-cluttered).
       const showLabels = k > 1.5 || nodes.length < 120;
       const labelCands: { n: GNode; lit: boolean; pri: number }[] = [];
+      alphaHot = false;
       for (const n of nodes) {
         if (n.x == null) continue;
         const lit = isLit(n.id);
         const emphasised = n.id === focus || n.id === pinned || highlight.has(n.id) || (nbr?.has(n.id) ?? false);
+        // ease opacity toward its target so isolate / focus / highlight fade in
+        // smoothly instead of snapping.
+        const target = lit ? 1 : 0.13;
+        n.alpha = n.alpha == null ? target : n.alpha + (target - n.alpha) * 0.2;
+        if (Math.abs(target - n.alpha) > 0.006) alphaHot = true; else n.alpha = target;
         if (emphasised) { ctx.shadowColor = n.color; ctx.shadowBlur = (n.id === focus || n.id === pinned ? 16 : 8); }
         ctx.beginPath(); ctx.arc(n.x, n.y!, n.r, 0, 2 * Math.PI);
-        ctx.fillStyle = n.color; ctx.globalAlpha = lit ? 1 : 0.13; ctx.fill();
+        ctx.fillStyle = n.color; ctx.globalAlpha = n.alpha; ctx.fill();
         ctx.shadowBlur = 0; ctx.globalAlpha = 1;
         if (n.id === pinned || n.id === focusPin) { const pulse = 1 + 0.18 * Math.sin(now / 380); ctx.beginPath(); ctx.arc(n.x, n.y!, n.r * pulse + 3 / k, 0, 2 * Math.PI); ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2 / k; ctx.stroke(); }
         else if (n.id === focus) { ctx.beginPath(); ctx.arc(n.x, n.y!, n.r + 2.5 / k, 0, 2 * Math.PI); ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 1.6 / k; ctx.stroke(); }
@@ -267,7 +276,7 @@ export default function GraphView({
 
     // --- animation loop (runs while settling / focused; single-frame otherwise) ---
     let running = false;
-    const busy = () => (sim != null && sim.alpha() > sim.alphaMin()) || interactRef.current.hover !== null || interactRef.current.pinned !== null || interactRef.current.focusPin !== null;
+    const busy = () => alphaHot || (sim != null && sim.alpha() > sim.alphaMin()) || interactRef.current.hover !== null || interactRef.current.pinned !== null || interactRef.current.focusPin !== null;
     const frame = () => { draw(performance.now()); running = busy(); if (running) requestAnimationFrame(frame); };
     const kick = () => { if (!running) { running = true; requestAnimationFrame(frame); } };
     kickRef.current = kick;
@@ -329,7 +338,9 @@ export default function GraphView({
       const hit = pick(mx, my), id = hit?.id ?? null;
       if (id !== interactRef.current.hover) {
         interactRef.current.hover = id; canvas!.style.cursor = hit ? "pointer" : "grab";
-        if (hit && hit.x != null) setHoverInfo({ label: hit.label, folder: hit.folder, color: hit.color, imports: (dir.out.get(hit.id) ?? []).length, importers: (dir.inc.get(hit.id) ?? []).length, sx: hit.x * transform.k + transform.x, sy: hit.y! * transform.k + transform.y });
+        // Skip the banner for the pinned node — its details are already in the
+        // drawer, and the card would otherwise cover its lit-up neighbours.
+        if (hit && hit.x != null && hit.id !== interactRef.current.pinned) setHoverInfo({ label: hit.label, folder: hit.folder, color: hit.color, imports: (dir.out.get(hit.id) ?? []).length, importers: (dir.inc.get(hit.id) ?? []).length, sx: hit.x * transform.k + transform.x, sy: hit.y! * transform.k + transform.y });
         else setHoverInfo(null);
         kick();
       }
@@ -338,7 +349,7 @@ export default function GraphView({
     const onUp = () => { if (dragging) { dragging.fx = null; dragging.fy = null; sim?.alphaTarget(0); dragging = null; } };
     const onClick = (ev: MouseEvent) => {
       const rect = canvas!.getBoundingClientRect(); const hit = pick(ev.clientX - rect.left, ev.clientY - rect.top);
-      if (hit) { setSelected({ id: hit.id, label: hit.label, path: hit.path, kind: hit.kind }); onSelectNode(hit.id, hit.label); if (hit.path && hit.kind === "file") onExpandFile?.(hit.path); }
+      if (hit) { setSelected({ id: hit.id, label: hit.label, path: hit.path, kind: hit.kind }); onSelectNode(hit.id, hit.label); setHoverInfo(null); if (hit.path && hit.kind === "file") onExpandFile?.(hit.path); }
       else {
         // Click on empty space = reset: drop the query highlight + selection and
         // return the whole graph to its neutral, full-brightness state.
@@ -416,7 +427,6 @@ export default function GraphView({
     setSearch(""); setSearchOpen(false);
   }, [nodeById, neighbourMap, onSelectNode, onExpandFile]);
 
-  const selectedFns = useMemo(() => (selected?.path ? functions.filter((f) => f.file === selected.path) : []), [functions, selected]);
   const imports = useMemo(() => (selected ? (dir.out.get(selected.id) ?? []).map((i) => nodeById.get(i)).filter((n): n is GNode => !!n) : []), [selected, dir, nodeById]);
   const importers = useMemo(() => (selected ? (dir.inc.get(selected.id) ?? []).map((i) => nodeById.get(i)).filter((n): n is GNode => !!n) : []), [selected, dir, nodeById]);
   const clearSelection = useCallback(() => { setSelected(null); onSelectNode(null, null); }, [onSelectNode]);
@@ -528,18 +538,40 @@ export default function GraphView({
                 </div>
               </div>
               <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-3.5 py-3.5">
+                {selected.path && (
+                  <FileSummary
+                    text={fileSummary?.path === selected.path ? fileSummary.text : ""}
+                    loading={summaryLoading && fileSummary?.path !== selected.path}
+                  />
+                )}
                 <Connections title="Imports" hint="depends on" color={OUT_COLOR} items={imports} onGo={navigateTo} />
                 <Connections title="Imported by" hint="depended on by" color={IN_COLOR} items={importers} onGo={navigateTo} />
-                {selected.path ? (
-                  <div>
-                    <div className="mb-1.5 px-1 text-[10px] font-medium uppercase tracking-wider text-neutral-600">{selectedFns.length > 0 ? `${selectedFns.length} symbol${selectedFns.length === 1 ? "" : "s"}` : "Symbols"}</div>
-                    {selectedFns.length > 0 ? <div className="space-y-1.5">{selectedFns.map((fn) => <FnEntry key={fn.symbol + fn.start_line} fn={fn} />)}</div> : <div className="px-1 text-[12px] text-neutral-500">Loading functions…</div>}
-                  </div>
-                ) : <div className="px-1 text-[12px] text-neutral-500">External dependency / route — no local source to open.</div>}
+                {!selected.path && <div className="px-1 text-[12px] text-neutral-500">External dependency / route — no local source to open.</div>}
               </div>
             </aside>
           )}
         </>
+      )}
+    </div>
+  );
+}
+
+function FileSummary({ text, loading }: { text: string; loading: boolean }) {
+  if (!text && !loading) return null;
+  return (
+    <div className="rounded-lg border border-white/[0.07] bg-white/[0.025] px-3 py-2.5">
+      <div className="mb-1.5 flex items-center gap-1.5">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-neutral-500">Summary</span>
+        <span className="rounded bg-indigo-500/[0.12] px-1 py-px text-[8px] font-semibold uppercase tracking-wider text-indigo-300/90">AI</span>
+      </div>
+      {loading ? (
+        <div className="space-y-1.5 py-0.5">
+          <div className="h-2 w-full animate-pulse rounded bg-white/[0.06]" />
+          <div className="h-2 w-[86%] animate-pulse rounded bg-white/[0.06]" />
+          <div className="h-2 w-[62%] animate-pulse rounded bg-white/[0.06]" />
+        </div>
+      ) : (
+        <p className="text-[12px] leading-relaxed text-neutral-300">{text}</p>
       )}
     </div>
   );
@@ -564,17 +596,3 @@ function Connections({ title, hint, color, items, onGo }: { title: string; hint:
   );
 }
 
-function FnEntry({ fn }: { fn: FunctionHit }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="overflow-hidden rounded-lg border border-white/[0.08] bg-white/[0.02]">
-      <button onClick={() => setOpen((o) => !o)} className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-white/[0.03]">
-        <span className="font-mono text-[11px] text-indigo-300">ƒ</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-neutral-200">{fn.symbol}</span>
-        <span className="shrink-0 text-[9px] text-neutral-600">L{fn.start_line}</span>
-        <span className="shrink-0 select-none text-[9px] text-neutral-500">{open ? "▾" : "▸"}</span>
-      </button>
-      {open && <pre className="max-h-64 overflow-auto border-t border-white/[0.08] bg-black/40 p-2.5 text-[10px] leading-relaxed text-neutral-300"><code>{fn.code}</code></pre>}
-    </div>
-  );
-}
